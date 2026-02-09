@@ -1,4 +1,4 @@
-# rodney: Chrome Automation from the Command Line
+# Rodney: Chrome automation from the command line
 
 [![PyPI](https://img.shields.io/pypi/v/rodney.svg)](https://pypi.org/project/rodney/)
 [![Changelog](https://img.shields.io/github/v/release/simonw/rodney?include_prereleases&label=changelog)](https://github.com/simonw/rodney/releases)
