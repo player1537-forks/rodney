@@ -22,6 +22,8 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
+var version = "dev"
+
 // State persisted between CLI invocations
 type State struct {
 	DebugURL    string `json:"debug_url"`
@@ -34,7 +36,7 @@ type State struct {
 
 func stateDir() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".rod-cli")
+	return filepath.Join(home, ".rodney")
 }
 
 func statePath() string {
@@ -44,7 +46,7 @@ func statePath() string {
 func loadState() (*State, error) {
 	data, err := os.ReadFile(statePath())
 	if err != nil {
-		return nil, fmt.Errorf("no browser session (run 'rod-cli start' first)")
+		return nil, fmt.Errorf("no browser session (run 'rodney start' first)")
 	}
 	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -94,58 +96,58 @@ func getActivePage(browser *rod.Browser, s *State) (*rod.Page, error) {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `rod-cli - Chrome automation from the command line
+	fmt.Fprintf(os.Stderr, `rodney - Chrome automation from the command line
 
 Browser lifecycle:
-  rod-cli start                    Launch headless Chrome
-  rod-cli stop                     Shut down Chrome
-  rod-cli status                   Show browser status
+  rodney start                    Launch headless Chrome
+  rodney stop                     Shut down Chrome
+  rodney status                   Show browser status
 
 Navigation:
-  rod-cli open <url>               Navigate to URL
-  rod-cli back                     Go back in history
-  rod-cli forward                  Go forward in history
-  rod-cli reload                   Reload current page
+  rodney open <url>               Navigate to URL
+  rodney back                     Go back in history
+  rodney forward                  Go forward in history
+  rodney reload                   Reload current page
 
 Page info:
-  rod-cli url                      Print current URL
-  rod-cli title                    Print page title
-  rod-cli html [selector]          Print HTML (page or element)
-  rod-cli text <selector>          Print text content of element
-  rod-cli attr <selector> <name>   Print attribute value
-  rod-cli pdf [file]               Save page as PDF
+  rodney url                      Print current URL
+  rodney title                    Print page title
+  rodney html [selector]          Print HTML (page or element)
+  rodney text <selector>          Print text content of element
+  rodney attr <selector> <name>   Print attribute value
+  rodney pdf [file]               Save page as PDF
 
 Interaction:
-  rod-cli js <expression>          Evaluate JavaScript expression
-  rod-cli click <selector>         Click an element
-  rod-cli input <selector> <text>  Type text into an input field
-  rod-cli clear <selector>         Clear an input field
-  rod-cli select <selector> <val>  Select dropdown option by value
-  rod-cli submit <selector>        Submit a form
-  rod-cli hover <selector>         Hover over an element
-  rod-cli focus <selector>         Focus an element
+  rodney js <expression>          Evaluate JavaScript expression
+  rodney click <selector>         Click an element
+  rodney input <selector> <text>  Type text into an input field
+  rodney clear <selector>         Clear an input field
+  rodney select <selector> <val>  Select dropdown option by value
+  rodney submit <selector>        Submit a form
+  rodney hover <selector>         Hover over an element
+  rodney focus <selector>         Focus an element
 
 Waiting:
-  rod-cli wait <selector>          Wait for element to appear
-  rod-cli waitload                 Wait for page load
-  rod-cli waitstable               Wait for DOM to stabilize
-  rod-cli waitidle                 Wait for network idle
-  rod-cli sleep <seconds>          Sleep for N seconds
+  rodney wait <selector>          Wait for element to appear
+  rodney waitload                 Wait for page load
+  rodney waitstable               Wait for DOM to stabilize
+  rodney waitidle                 Wait for network idle
+  rodney sleep <seconds>          Sleep for N seconds
 
 Screenshots:
-  rod-cli screenshot [-w N] [-h N] [file]  Take page screenshot
-  rod-cli screenshot-el <sel> [f]  Screenshot an element
+  rodney screenshot [-w N] [-h N] [file]  Take page screenshot
+  rodney screenshot-el <sel> [f]  Screenshot an element
 
 Tabs:
-  rod-cli pages                    List all pages/tabs
-  rod-cli page <index>             Switch to page by index
-  rod-cli newpage [url]            Open a new page/tab
-  rod-cli closepage [index]        Close a page/tab
+  rodney pages                    List all pages/tabs
+  rodney page <index>             Switch to page by index
+  rodney newpage [url]            Open a new page/tab
+  rodney closepage [index]        Close a page/tab
 
 Element queries:
-  rod-cli exists <selector>        Check if element exists (exit 0/1)
-  rod-cli count <selector>         Count matching elements
-  rod-cli visible <selector>       Check if element is visible (exit 0/1)
+  rodney exists <selector>        Check if element exists (exit 0/1)
+  rodney count <selector>         Count matching elements
+  rodney visible <selector>       Check if element is visible (exit 0/1)
 `)
 	os.Exit(1)
 }
@@ -162,6 +164,11 @@ func main() {
 
 	cmd := os.Args[1]
 	args := os.Args[2:]
+
+	if cmd == "--version" {
+		fmt.Println(version)
+		os.Exit(0)
+	}
 
 	switch cmd {
 	case "_proxy":
@@ -410,7 +417,7 @@ func cmdStatus(args []string) {
 
 func cmdOpen(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli open <url>")
+		fatal("usage: rodney open <url>")
 	}
 	url := args[0]
 	// Add scheme if missing
@@ -515,7 +522,7 @@ func cmdHTML(args []string) {
 
 func cmdText(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli text <selector>")
+		fatal("usage: rodney text <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -531,7 +538,7 @@ func cmdText(args []string) {
 
 func cmdAttr(args []string) {
 	if len(args) < 2 {
-		fatal("usage: rod-cli attr <selector> <attribute>")
+		fatal("usage: rodney attr <selector> <attribute>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -575,7 +582,7 @@ func cmdPDF(args []string) {
 
 func cmdJS(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli js <expression>")
+		fatal("usage: rodney js <expression>")
 	}
 	expr := strings.Join(args, " ")
 	_, _, page := withPage()
@@ -609,7 +616,7 @@ func cmdJS(args []string) {
 
 func cmdClick(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli click <selector>")
+		fatal("usage: rodney click <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -626,7 +633,7 @@ func cmdClick(args []string) {
 
 func cmdInput(args []string) {
 	if len(args) < 2 {
-		fatal("usage: rod-cli input <selector> <text>")
+		fatal("usage: rodney input <selector> <text>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -640,7 +647,7 @@ func cmdInput(args []string) {
 
 func cmdClear(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli clear <selector>")
+		fatal("usage: rodney clear <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -653,7 +660,7 @@ func cmdClear(args []string) {
 
 func cmdSelect(args []string) {
 	if len(args) < 2 {
-		fatal("usage: rod-cli select <selector> <value>")
+		fatal("usage: rodney select <selector> <value>")
 	}
 	_, _, page := withPage()
 	// Use JavaScript to set the value, as rod's Select matches by text
@@ -673,7 +680,7 @@ func cmdSelect(args []string) {
 
 func cmdSubmit(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli submit <selector>")
+		fatal("usage: rodney submit <selector>")
 	}
 	_, _, page := withPage()
 	_, err := page.Element(args[0])
@@ -686,7 +693,7 @@ func cmdSubmit(args []string) {
 
 func cmdHover(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli hover <selector>")
+		fatal("usage: rodney hover <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -699,7 +706,7 @@ func cmdHover(args []string) {
 
 func cmdFocus(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli focus <selector>")
+		fatal("usage: rodney focus <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -712,7 +719,7 @@ func cmdFocus(args []string) {
 
 func cmdWait(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli wait <selector>")
+		fatal("usage: rodney wait <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -743,7 +750,7 @@ func cmdWaitIdle(args []string) {
 
 func cmdSleep(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli sleep <seconds>")
+		fatal("usage: rodney sleep <seconds>")
 	}
 	secs, err := strconv.ParseFloat(args[0], 64)
 	if err != nil {
@@ -837,7 +844,7 @@ func cmdScreenshot(args []string) {
 
 func cmdScreenshotEl(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli screenshot-el <selector> [file]")
+		fatal("usage: rodney screenshot-el <selector> [file]")
 	}
 	file := "element.png"
 	if len(args) > 1 {
@@ -887,7 +894,7 @@ func cmdPages(args []string) {
 
 func cmdPage(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli page <index>")
+		fatal("usage: rodney page <index>")
 	}
 	idx, err := strconv.Atoi(args[0])
 	if err != nil {
@@ -1003,7 +1010,7 @@ func cmdClosePage(args []string) {
 
 func cmdExists(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli exists <selector>")
+		fatal("usage: rodney exists <selector>")
 	}
 	_, _, page := withPage()
 	has, _, err := page.Has(args[0])
@@ -1021,7 +1028,7 @@ func cmdExists(args []string) {
 
 func cmdCount(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli count <selector>")
+		fatal("usage: rodney count <selector>")
 	}
 	_, _, page := withPage()
 	els, err := page.Elements(args[0])
@@ -1033,7 +1040,7 @@ func cmdCount(args []string) {
 
 func cmdVisible(args []string) {
 	if len(args) < 1 {
-		fatal("usage: rod-cli visible <selector>")
+		fatal("usage: rodney visible <selector>")
 	}
 	_, _, page := withPage()
 	el, err := page.Element(args[0])
@@ -1091,11 +1098,11 @@ func detectProxy() (server, user, pass string, needed bool) {
 	return server, user, pass, true
 }
 
-// cmdInternalProxy is a hidden subcommand: rod-cli _proxy <port> <upstream> <authHeader>
+// cmdInternalProxy is a hidden subcommand: rodney _proxy <port> <upstream> <authHeader>
 // It runs a local auth proxy that forwards to the upstream proxy with credentials.
 func cmdInternalProxy(args []string) {
 	if len(args) < 3 {
-		fatal("usage: rod-cli _proxy <port> <upstream> <authHeader>")
+		fatal("usage: rodney _proxy <port> <upstream> <authHeader>")
 	}
 	port := args[0]
 	upstream := args[1]

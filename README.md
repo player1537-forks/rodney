@@ -1,19 +1,19 @@
-# rod-cli: Chrome Automation from the Command Line
+# rodney: Chrome Automation from the Command Line
 
 A Go CLI tool that drives a persistent headless Chrome instance using the [rod](https://github.com/go-rod/rod) browser automation library. Each command connects to the same long-running Chrome process, making it easy to script multi-step browser interactions from shell scripts or interactive use.
 
 ## Architecture
 
 ```
-rod-cli start     →  launches Chrome (headless, persists after CLI exits)
-                     saves WebSocket debug URL to ~/.rod-cli/state.json
+rodney start     →  launches Chrome (headless, persists after CLI exits)
+                     saves WebSocket debug URL to ~/.rodney/state.json
 
-rod-cli open URL  →  connects to running Chrome via WebSocket
+rodney open URL  →  connects to running Chrome via WebSocket
                      navigates the active tab, disconnects
 
-rod-cli js EXPR   →  connects, evaluates JS, prints result, disconnects
+rodney js EXPR   →  connects, evaluates JS, prints result, disconnects
 
-rod-cli stop      →  connects and shuts down Chrome, cleans up state
+rodney stop      →  connects and shuts down Chrome, cleans up state
 ```
 
 Each CLI invocation is a short-lived process. Chrome runs independently and tabs persist between commands.
@@ -21,8 +21,7 @@ Each CLI invocation is a short-lived process. Chrome runs independently and tabs
 ## Building
 
 ```bash
-cd go-rod-cli
-go build -o rod-cli .
+go build -o rodney .
 ```
 
 Requires:
@@ -34,41 +33,41 @@ Requires:
 ### Start/stop the browser
 
 ```bash
-rod-cli start          # Launch headless Chrome
-rod-cli status         # Show browser info and active page
-rod-cli stop           # Shut down Chrome
+rodney start          # Launch headless Chrome
+rodney status         # Show browser info and active page
+rodney stop           # Shut down Chrome
 ```
 
 ### Navigate
 
 ```bash
-rod-cli open https://example.com    # Navigate to URL
-rod-cli open example.com            # http:// prefix added automatically
-rod-cli back                        # Go back
-rod-cli forward                     # Go forward
-rod-cli reload                      # Reload page
+rodney open https://example.com    # Navigate to URL
+rodney open example.com            # http:// prefix added automatically
+rodney back                        # Go back
+rodney forward                     # Go forward
+rodney reload                      # Reload page
 ```
 
 ### Extract information
 
 ```bash
-rod-cli url                    # Print current URL
-rod-cli title                  # Print page title
-rod-cli text "h1"              # Print text content of element
-rod-cli html "div.content"     # Print outer HTML of element
-rod-cli html                   # Print full page HTML
-rod-cli attr "a#link" href     # Print attribute value
-rod-cli pdf output.pdf         # Save page as PDF
+rodney url                    # Print current URL
+rodney title                  # Print page title
+rodney text "h1"              # Print text content of element
+rodney html "div.content"     # Print outer HTML of element
+rodney html                   # Print full page HTML
+rodney attr "a#link" href     # Print attribute value
+rodney pdf output.pdf         # Save page as PDF
 ```
 
 ### Run JavaScript
 
 ```bash
-rod-cli js document.title                        # Evaluate expression
-rod-cli js "1 + 2"                               # Math
-rod-cli js 'document.querySelector("h1").textContent'  # DOM queries
-rod-cli js '[1,2,3].map(x => x * 2)'            # Returns pretty-printed JSON
-rod-cli js 'document.querySelectorAll("a").length'     # Count elements
+rodney js document.title                        # Evaluate expression
+rodney js "1 + 2"                               # Math
+rodney js 'document.querySelector("h1").textContent'  # DOM queries
+rodney js '[1,2,3].map(x => x * 2)'            # Returns pretty-printed JSON
+rodney js 'document.querySelectorAll("a").length'     # Count elements
 ```
 
 The expression is automatically wrapped in `() => { return (expr); }`.
@@ -76,74 +75,74 @@ The expression is automatically wrapped in `() => { return (expr); }`.
 ### Interact with elements
 
 ```bash
-rod-cli click "button#submit"       # Click element
-rod-cli input "#search" "query"     # Type into input field
-rod-cli clear "#search"             # Clear input field
-rod-cli select "#dropdown" "value"  # Select dropdown by value
-rod-cli submit "form#login"         # Submit a form
-rod-cli hover ".menu-item"          # Hover over element
-rod-cli focus "#email"              # Focus element
+rodney click "button#submit"       # Click element
+rodney input "#search" "query"     # Type into input field
+rodney clear "#search"             # Clear input field
+rodney select "#dropdown" "value"  # Select dropdown by value
+rodney submit "form#login"         # Submit a form
+rodney hover ".menu-item"          # Hover over element
+rodney focus "#email"              # Focus element
 ```
 
 ### Wait for conditions
 
 ```bash
-rod-cli wait ".loaded"       # Wait for element to appear and be visible
-rod-cli waitload             # Wait for page load event
-rod-cli waitstable           # Wait for DOM to stop changing
-rod-cli waitidle             # Wait for network to be idle
-rod-cli sleep 2.5            # Sleep for N seconds
+rodney wait ".loaded"       # Wait for element to appear and be visible
+rodney waitload             # Wait for page load event
+rodney waitstable           # Wait for DOM to stop changing
+rodney waitidle             # Wait for network to be idle
+rodney sleep 2.5            # Sleep for N seconds
 ```
 
 ### Screenshots
 
 ```bash
-rod-cli screenshot                      # Save as screenshot.png
-rod-cli screenshot page.png             # Save to specific file
-rod-cli screenshot-el ".chart" chart.png  # Screenshot specific element
+rodney screenshot                      # Save as screenshot.png
+rodney screenshot page.png             # Save to specific file
+rodney screenshot-el ".chart" chart.png  # Screenshot specific element
 ```
 
 ### Manage tabs
 
 ```bash
-rod-cli pages                    # List all tabs (* marks active)
-rod-cli newpage https://...      # Open URL in new tab
-rod-cli page 1                   # Switch to tab by index
-rod-cli closepage 1              # Close tab by index
-rod-cli closepage                # Close active tab
+rodney pages                    # List all tabs (* marks active)
+rodney newpage https://...      # Open URL in new tab
+rodney page 1                   # Switch to tab by index
+rodney closepage 1              # Close tab by index
+rodney closepage                # Close active tab
 ```
 
 ### Query elements
 
 ```bash
-rod-cli exists ".loading"    # Exit 0 if exists, exit 1 if not
-rod-cli count "li.item"      # Print number of matching elements
-rod-cli visible "#modal"     # Exit 0 if visible, exit 1 if not
+rodney exists ".loading"    # Exit 0 if exists, exit 1 if not
+rodney count "li.item"      # Print number of matching elements
+rodney visible "#modal"     # Exit 0 if visible, exit 1 if not
 ```
 
 ### Shell scripting examples
 
 ```bash
 # Wait for page to load and extract data
-rod-cli start
-rod-cli open https://example.com
-rod-cli waitstable
-title=$(rod-cli title)
+rodney start
+rodney open https://example.com
+rodney waitstable
+title=$(rodney title)
 echo "Page: $title"
 
 # Conditional logic based on element presence
-if rod-cli exists ".error-message"; then
-    rod-cli text ".error-message"
+if rodney exists ".error-message"; then
+    rodney text ".error-message"
 fi
 
 # Loop through pages
 for url in page1 page2 page3; do
-    rod-cli open "https://example.com/$url"
-    rod-cli waitstable
-    rod-cli screenshot "${url}.png"
+    rodney open "https://example.com/$url"
+    rodney waitstable
+    rodney screenshot "${url}.png"
 done
 
-rod-cli stop
+rodney stop
 ```
 
 ## Configuration
@@ -154,17 +153,17 @@ rod-cli stop
 | `ROD_TIMEOUT` | `30` | Default timeout in seconds for element queries |
 | `HTTPS_PROXY` / `HTTP_PROXY` | (none) | Authenticated proxy auto-detected on start |
 
-State is stored in `~/.rod-cli/state.json`. Chrome user data is stored in `~/.rod-cli/chrome-data/`.
+State is stored in `~/.rodney/state.json`. Chrome user data is stored in `~/.rodney/chrome-data/`.
 
 ## Proxy support
 
-In environments with authenticated HTTP proxies (e.g., `HTTPS_PROXY=http://user:pass@host:port`), `rod-cli start` automatically:
+In environments with authenticated HTTP proxies (e.g., `HTTPS_PROXY=http://user:pass@host:port`), `rodney start` automatically:
 
 1. Detects the proxy credentials from environment variables
 2. Launches a local forwarding proxy that injects `Proxy-Authorization` headers into CONNECT requests
 3. Configures Chrome to use the local proxy
 
-This is necessary because Chrome cannot natively authenticate to proxies during HTTPS tunnel (CONNECT) establishment. The local proxy runs as a background process and is automatically cleaned up by `rod-cli stop`.
+This is necessary because Chrome cannot natively authenticate to proxies during HTTPS tunnel (CONNECT) establishment. The local proxy runs as a background process and is automatically cleaned up by `rodney stop`.
 
 See [claude-code-chrome-proxy.md](claude-code-chrome-proxy.md) for detailed technical notes.
 

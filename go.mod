@@ -1,4 +1,4 @@
-module rod-cli
+module github.com/simonw/rodney
 
 go 1.24.7
 

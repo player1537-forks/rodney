@@ -82,15 +82,15 @@ Target Server
 
 ### The auth proxy helper
 
-The `rod-cli` binary doubles as a proxy when invoked with the hidden `_proxy` subcommand:
+The `rodney` binary doubles as a proxy when invoked with the hidden `_proxy` subcommand:
 
 ```bash
-rod-cli _proxy <port> <upstream-host:port> <auth-header>
+rodney _proxy <port> <upstream-host:port> <auth-header>
 ```
 
-This is launched as a background process by `rod-cli start`. It runs in its own
+This is launched as a background process by `rodney start`. It runs in its own
 session (`Setsid: true`) so it survives after the parent exits. Its PID is stored
-in `~/.rod-cli/state.json` and killed by `rod-cli stop`.
+in `~/.rodney/state.json` and killed by `rodney stop`.
 
 ### CONNECT handling (the critical part)
 
@@ -146,21 +146,21 @@ If no authenticated proxy is detected, Chrome launches normally without the help
 ### Full startup sequence with proxy
 
 ```
-rod-cli start
+rodney start
   1. detectProxy() -> finds HTTPS_PROXY with auth
   2. Find free port for local proxy
-  3. Launch: rod-cli _proxy <port> <upstream> <authHeader> (background, detached)
+  3. Launch: rodney _proxy <port> <upstream> <authHeader> (background, detached)
   4. Store proxy PID in state
   5. Launch Chrome with --proxy-server=http://127.0.0.1:<port>
                         --ignore-certificate-errors
   6. Store Chrome PID and debug URL in state
 
-rod-cli open https://www.example.com/
+rodney open https://www.example.com/
   1. Load state, connect to Chrome via WebSocket
   2. Navigate page (Chrome -> local proxy -> upstream proxy -> target)
   3. Return page title
 
-rod-cli stop
+rodney stop
   1. Close Chrome via CDP
   2. Kill proxy helper by PID
   3. Remove state file
@@ -200,20 +200,20 @@ NO_PROXY=localhost,127.0.0.1,169.254.169.254,metadata.google.internal,...
 ```
 
 Chrome respects `NO_PROXY` for the `--proxy-server` flag, so local URLs bypass the
-proxy automatically. This is why `rod-cli open http://127.0.0.1:18080/` always worked
+proxy automatically. This is why `rodney open http://127.0.0.1:18080/` always worked
 even before adding proxy support.
 
 ## Testing
 
 Verified with:
 ```bash
-rod-cli start                                    # Proxy auto-detected and started
-rod-cli open https://www.example.com/            # Page loaded successfully
-rod-cli title                                    # "Example Domain"
-rod-cli text h1                                  # "Example Domain"
-rod-cli js 'document.querySelector("p").textContent'  # Full paragraph text
-rod-cli screenshot /tmp/example.png              # 19KB PNG of the page
-rod-cli stop                                     # Chrome and proxy cleaned up
+rodney start                                    # Proxy auto-detected and started
+rodney open https://www.example.com/            # Page loaded successfully
+rodney title                                    # "Example Domain"
+rodney text h1                                  # "Example Domain"
+rodney js 'document.querySelector("p").textContent'  # Full paragraph text
+rodney screenshot /tmp/example.png              # 19KB PNG of the page
+rodney stop                                     # Chrome and proxy cleaned up
 ```
 
 ## Summary
