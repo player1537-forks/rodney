@@ -165,6 +165,10 @@ func main() {
 		cmdSubmit(args)
 	case "hover":
 		cmdHover(args)
+	case "file":
+		cmdFile(args)
+	case "download":
+		cmdDownload(args)
 	case "focus":
 		cmdFocus(args)
 	case "wait":
@@ -617,6 +621,199 @@ func cmdClear(args []string) {
 	}
 	el.MustSelectAllText().MustInput("")
 	fmt.Println("Cleared")
+}
+
+func cmdFile(args []string) {
+	if len(args) < 2 {
+		fatal("usage: rodney file <selector> <path|->")
+	}
+	selector := args[0]
+	filePath := args[1]
+
+	_, _, page := withPage()
+	el, err := page.Element(selector)
+	if err != nil {
+		fatal("element not found: %v", err)
+	}
+
+	if filePath == "-" {
+		// Read from stdin to a temp file
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fatal("failed to read stdin: %v", err)
+		}
+		tmp, err := os.CreateTemp("", "rodney-upload-*")
+		if err != nil {
+			fatal("failed to create temp file: %v", err)
+		}
+		if _, err := tmp.Write(data); err != nil {
+			tmp.Close()
+			fatal("failed to write temp file: %v", err)
+		}
+		tmp.Close()
+		filePath = tmp.Name()
+	} else {
+		if _, err := os.Stat(filePath); err != nil {
+			fatal("file not found: %v", err)
+		}
+	}
+
+	if err := el.SetFiles([]string{filePath}); err != nil {
+		fatal("failed to set file: %v", err)
+	}
+	fmt.Printf("Set file: %s\n", args[1])
+}
+
+func cmdDownload(args []string) {
+	if len(args) < 1 {
+		fatal("usage: rodney download <selector> [file|-]")
+	}
+	selector := args[0]
+	outFile := ""
+	if len(args) > 1 {
+		outFile = args[1]
+	}
+
+	_, _, page := withPage()
+	el, err := page.Element(selector)
+	if err != nil {
+		fatal("element not found: %v", err)
+	}
+
+	// Get the URL from the element's href or src attribute
+	urlStr := ""
+	if v := el.MustAttribute("href"); v != nil {
+		urlStr = *v
+	} else if v := el.MustAttribute("src"); v != nil {
+		urlStr = *v
+	} else {
+		fatal("element has no href or src attribute")
+	}
+
+	var data []byte
+
+	if strings.HasPrefix(urlStr, "data:") {
+		data, err = decodeDataURL(urlStr)
+		if err != nil {
+			fatal("failed to decode data URL: %v", err)
+		}
+	} else {
+		// Use fetch() in the page context so it has cookies/session
+		// Also resolves relative URLs automatically
+		js := fmt.Sprintf(`async () => {
+			const resp = await fetch(%q);
+			if (!resp.ok) throw new Error('HTTP ' + resp.status);
+			const buf = await resp.arrayBuffer();
+			const bytes = new Uint8Array(buf);
+			let binary = '';
+			for (let i = 0; i < bytes.length; i++) {
+				binary += String.fromCharCode(bytes[i]);
+			}
+			return btoa(binary);
+		}`, urlStr)
+		result, err := page.Eval(js)
+		if err != nil {
+			fatal("download failed: %v", err)
+		}
+		data, err = base64.StdEncoding.DecodeString(result.Value.Str())
+		if err != nil {
+			fatal("failed to decode response: %v", err)
+		}
+	}
+
+	if outFile == "-" {
+		os.Stdout.Write(data)
+		return
+	}
+
+	if outFile == "" {
+		outFile = inferDownloadFilename(urlStr)
+	}
+
+	if err := os.WriteFile(outFile, data, 0644); err != nil {
+		fatal("failed to write file: %v", err)
+	}
+	fmt.Printf("Saved %s (%d bytes)\n", outFile, len(data))
+}
+
+// decodeDataURL decodes a data:[<mediatype>][;base64],<data> URL.
+func decodeDataURL(dataURL string) ([]byte, error) {
+	// Find the comma separating metadata from data
+	commaIdx := strings.Index(dataURL, ",")
+	if commaIdx < 0 {
+		return nil, fmt.Errorf("invalid data URL: no comma found")
+	}
+	meta := dataURL[5:commaIdx] // skip "data:"
+	encoded := dataURL[commaIdx+1:]
+
+	if strings.HasSuffix(meta, ";base64") {
+		return base64.StdEncoding.DecodeString(encoded)
+	}
+	// URL-encoded text
+	decoded, err := url.QueryUnescape(encoded)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(decoded), nil
+}
+
+// inferDownloadFilename tries to extract a reasonable filename from a URL.
+func inferDownloadFilename(urlStr string) string {
+	if strings.HasPrefix(urlStr, "data:") {
+		// Extract MIME type for extension
+		commaIdx := strings.Index(urlStr, ",")
+		if commaIdx > 0 {
+			meta := urlStr[5:commaIdx]
+			meta = strings.TrimSuffix(meta, ";base64")
+			ext := mimeToExt(meta)
+			return nextAvailableFile("download", ext)
+		}
+		return nextAvailableFile("download", "")
+	}
+
+	parsed, err := url.Parse(urlStr)
+	if err == nil && parsed.Path != "" && parsed.Path != "/" {
+		base := filepath.Base(parsed.Path)
+		if base != "." && base != "/" {
+			return nextAvailableFile(
+				strings.TrimSuffix(base, filepath.Ext(base)),
+				filepath.Ext(base),
+			)
+		}
+	}
+	return nextAvailableFile("download", "")
+}
+
+// mimeToExt returns a file extension for common MIME types.
+func mimeToExt(mime string) string {
+	switch mime {
+	case "image/png":
+		return ".png"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/gif":
+		return ".gif"
+	case "image/webp":
+		return ".webp"
+	case "image/svg+xml":
+		return ".svg"
+	case "application/pdf":
+		return ".pdf"
+	case "text/plain":
+		return ".txt"
+	case "text/html":
+		return ".html"
+	case "text/css":
+		return ".css"
+	case "application/json":
+		return ".json"
+	case "application/javascript":
+		return ".js"
+	case "application/octet-stream":
+		return ".bin"
+	default:
+		return ""
+	}
 }
 
 func cmdSelect(args []string) {

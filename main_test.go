@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -42,6 +44,9 @@ func TestMain(m *testing.M) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/form", handleForm)
+	mux.HandleFunc("/upload", handleUpload)
+	mux.HandleFunc("/download", handleDownload)
+	mux.HandleFunc("/testfile.txt", handleTestFile)
 	mux.HandleFunc("/empty", handleEmpty)
 	server := httptest.NewServer(mux)
 
@@ -96,6 +101,41 @@ func handleForm(w http.ResponseWriter, r *http.Request) {
   </form>
 </body>
 </html>`))
+}
+
+func handleUpload(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<!DOCTYPE html>
+<html lang="en">
+<head><title>Upload Page</title></head>
+<body>
+  <input id="file-input" type="file" accept="image/*">
+  <span id="file-name"></span>
+  <script>
+    document.getElementById('file-input').addEventListener('change', function(e) {
+      document.getElementById('file-name').textContent = e.target.files[0] ? e.target.files[0].name : '';
+    });
+  </script>
+</body>
+</html>`))
+}
+
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<!DOCTYPE html>
+<html lang="en">
+<head><title>Download Page</title></head>
+<body>
+  <a id="file-link" href="/testfile.txt">Download file</a>
+  <a id="data-link" href="data:text/plain;base64,SGVsbG8gV29ybGQ=">Download data</a>
+  <img id="test-img" src="/testfile.txt">
+</body>
+</html>`))
+}
+
+func handleTestFile(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte("Hello World"))
 }
 
 func handleEmpty(w http.ResponseWriter, r *http.Request) {
@@ -410,5 +450,198 @@ func TestAXNode_SelectorNotFound(t *testing.T) {
 	_, err := getAXNode(shortPage, "#does-not-exist")
 	if err == nil {
 		t.Error("expected error for nonexistent selector, got nil")
+	}
+}
+
+// =====================
+// file command tests
+// =====================
+
+func TestFile_SetFileOnInput(t *testing.T) {
+	page := navigateTo(t, "/upload")
+
+	// Create a temp file to upload
+	tmp, err := os.CreateTemp("", "rodney-test-*.txt")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmp.Name())
+	tmp.Write([]byte("test content"))
+	tmp.Close()
+
+	el, err := page.Element("#file-input")
+	if err != nil {
+		t.Fatalf("element not found: %v", err)
+	}
+	if err := el.SetFiles([]string{tmp.Name()}); err != nil {
+		t.Fatalf("SetFiles failed: %v", err)
+	}
+
+	// Wait for the change event to fire and check the file name
+	page.MustWaitStable()
+	nameEl, err := page.Element("#file-name")
+	if err != nil {
+		t.Fatalf("file-name element not found: %v", err)
+	}
+	text, _ := nameEl.Text()
+	if text == "" {
+		t.Error("expected file name to be set after SetFiles, got empty string")
+	}
+}
+
+func TestFile_MultipleFiles(t *testing.T) {
+	page := navigateTo(t, "/upload")
+
+	tmp1, _ := os.CreateTemp("", "rodney-test1-*.txt")
+	defer os.Remove(tmp1.Name())
+	tmp1.Write([]byte("file 1"))
+	tmp1.Close()
+
+	tmp2, _ := os.CreateTemp("", "rodney-test2-*.txt")
+	defer os.Remove(tmp2.Name())
+	tmp2.Write([]byte("file 2"))
+	tmp2.Close()
+
+	el, err := page.Element("#file-input")
+	if err != nil {
+		t.Fatalf("element not found: %v", err)
+	}
+
+	// Setting files should not error even with multiple files
+	if err := el.SetFiles([]string{tmp1.Name(), tmp2.Name()}); err != nil {
+		t.Fatalf("SetFiles with multiple files failed: %v", err)
+	}
+}
+
+// =====================
+// download command tests
+// =====================
+
+func TestDownload_DataURL(t *testing.T) {
+	// Test decoding a data: URL directly
+	data, err := decodeDataURL("data:text/plain;base64,SGVsbG8gV29ybGQ=")
+	if err != nil {
+		t.Fatalf("decodeDataURL failed: %v", err)
+	}
+	if string(data) != "Hello World" {
+		t.Errorf("expected 'Hello World', got %q", string(data))
+	}
+}
+
+func TestDownload_DataURL_URLEncoded(t *testing.T) {
+	data, err := decodeDataURL("data:text/plain,Hello%20World")
+	if err != nil {
+		t.Fatalf("decodeDataURL failed: %v", err)
+	}
+	if string(data) != "Hello World" {
+		t.Errorf("expected 'Hello World', got %q", string(data))
+	}
+}
+
+func TestDownload_InferFilename_URL(t *testing.T) {
+	name := inferDownloadFilename("https://example.com/images/photo.png")
+	if name != "photo.png" {
+		t.Errorf("expected 'photo.png', got %q", name)
+	}
+}
+
+func TestDownload_InferFilename_DataURL(t *testing.T) {
+	name := inferDownloadFilename("data:image/png;base64,abc")
+	if !strings.HasPrefix(name, "download") || !strings.Contains(name, ".png") {
+		t.Errorf("expected 'download*.png', got %q", name)
+	}
+}
+
+func TestDownload_FetchLink(t *testing.T) {
+	page := navigateTo(t, "/download")
+
+	el, err := page.Element("#file-link")
+	if err != nil {
+		t.Fatalf("element not found: %v", err)
+	}
+	href := el.MustAttribute("href")
+	if href == nil {
+		t.Fatal("expected href attribute")
+	}
+
+	// Fetch using JS in the page context, same as cmdDownload does
+	js := fmt.Sprintf(`async () => {
+		const resp = await fetch(%q);
+		if (!resp.ok) throw new Error('HTTP ' + resp.status);
+		const buf = await resp.arrayBuffer();
+		const bytes = new Uint8Array(buf);
+		let binary = '';
+		for (let i = 0; i < bytes.length; i++) {
+			binary += String.fromCharCode(bytes[i]);
+		}
+		return btoa(binary);
+	}`, *href)
+	result, err := page.Eval(js)
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+
+	data, err := base64.StdEncoding.DecodeString(result.Value.Str())
+	if err != nil {
+		t.Fatalf("base64 decode failed: %v", err)
+	}
+	if string(data) != "Hello World" {
+		t.Errorf("expected 'Hello World', got %q", string(data))
+	}
+}
+
+func TestDownload_DataLinkElement(t *testing.T) {
+	page := navigateTo(t, "/download")
+
+	el, err := page.Element("#data-link")
+	if err != nil {
+		t.Fatalf("element not found: %v", err)
+	}
+	href := el.MustAttribute("href")
+	if href == nil {
+		t.Fatal("expected href attribute")
+	}
+
+	data, err := decodeDataURL(*href)
+	if err != nil {
+		t.Fatalf("decodeDataURL failed: %v", err)
+	}
+	if string(data) != "Hello World" {
+		t.Errorf("expected 'Hello World', got %q", string(data))
+	}
+}
+
+func TestDownload_ImgSrc(t *testing.T) {
+	page := navigateTo(t, "/download")
+
+	el, err := page.Element("#test-img")
+	if err != nil {
+		t.Fatalf("element not found: %v", err)
+	}
+	src := el.MustAttribute("src")
+	if src == nil {
+		t.Fatal("expected src attribute")
+	}
+	if *src != "/testfile.txt" {
+		t.Errorf("expected '/testfile.txt', got %q", *src)
+	}
+}
+
+func TestMimeToExt(t *testing.T) {
+	tests := []struct {
+		mime string
+		ext  string
+	}{
+		{"image/png", ".png"},
+		{"image/jpeg", ".jpg"},
+		{"application/pdf", ".pdf"},
+		{"text/plain", ".txt"},
+		{"unknown/type", ""},
+	}
+	for _, tt := range tests {
+		got := mimeToExt(tt.mime)
+		if got != tt.ext {
+			t.Errorf("mimeToExt(%q) = %q, want %q", tt.mime, got, tt.ext)
+		}
 	}
 }
