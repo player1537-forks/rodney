@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -30,15 +31,23 @@ var version = "dev"
 
 // State persisted between CLI invocations
 type State struct {
-	DebugURL    string `json:"debug_url"`
-	ChromePID   int    `json:"chrome_pid"`
-	ActivePage  int    `json:"active_page"`  // index into pages list
-	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	DebugURL       string `json:"debug_url"`
+	ChromePID      int    `json:"chrome_pid"`
+	ActivePage     int    `json:"active_page"`      // index into pages list
+	DataDir        string `json:"data_dir"`
+	ProxyPID       int    `json:"proxy_pid,omitempty"`   // PID of auth proxy helper
+	ProxyPort      int    `json:"proxy_port,omitempty"`  // local port of auth proxy
+	VideoRecording bool   `json:"video_recording,omitempty"`
+	VideoDir       string `json:"video_dir,omitempty"`
 }
 
+// stateDirOverride allows tests to redirect state to a temp dir
+var stateDirOverride string
+
 func stateDir() string {
+	if stateDirOverride != "" {
+		return stateDirOverride
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".rodney")
 }
@@ -109,6 +118,12 @@ func fatal(format string, args ...interface{}) {
 }
 
 func main() {
+	defer func() {
+		if videoCleanup != nil {
+			videoCleanup()
+		}
+	}()
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
@@ -181,6 +196,10 @@ func main() {
 		cmdScreenshot(args)
 	case "screenshot-el":
 		cmdScreenshotEl(args)
+	case "start-video":
+		cmdStartVideo(args)
+	case "stop-video":
+		cmdStopVideo(args)
 	case "pages":
 		cmdPages(args)
 	case "page":
@@ -222,6 +241,20 @@ func init() {
 	}
 }
 
+// videoCleanup is called at process exit to flush any in-progress video capture.
+var videoCleanup func()
+
+// maybeStartVideoCapture checks state and starts screencast if recording is active.
+// Returns a cleanup function (always safe to call, even if recording is off).
+func maybeStartVideoCapture(page *rod.Page) func() {
+	s, err := loadState()
+	if err != nil || !s.VideoRecording || s.VideoDir == "" {
+		return func() {}
+	}
+	stop := startVideoCapture(page, s.VideoDir)
+	return func() { stop() }
+}
+
 // withPage loads state, connects, and returns the active page.
 // Caller should NOT close the browser (we just disconnect).
 func withPage() (*State, *rod.Browser, *rod.Page) {
@@ -239,6 +272,8 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 	}
 	// Apply default timeout so element queries don't hang forever
 	page = page.Timeout(defaultTimeout)
+	// Start video capture if recording is active
+	videoCleanup = maybeStartVideoCapture(page)
 	return s, browser, page
 }
 
@@ -348,6 +383,10 @@ func cmdStop(args []string) {
 			proc.Signal(syscall.SIGTERM)
 		}
 	}
+	// Clean up any active video recording
+	if s.VideoRecording && s.VideoDir != "" {
+		os.RemoveAll(s.VideoDir)
+	}
 	removeState()
 	fmt.Println("Chrome stopped")
 }
@@ -373,6 +412,10 @@ func cmdStatus(args []string) {
 		if info != nil {
 			fmt.Printf("Current: %s - %s\n", info.Title, info.URL)
 		}
+	}
+	if s.VideoRecording {
+		frames := countFrames(s.VideoDir)
+		fmt.Printf("Recording video (%d frames captured)\n", frames)
 	}
 }
 
@@ -411,6 +454,8 @@ func cmdOpen(args []string) {
 			fatal("navigation failed: %v", err)
 		}
 	}
+	// Start video capture if recording is active
+	videoCleanup = maybeStartVideoCapture(page)
 	page.MustWaitLoad()
 	info, _ := page.Info()
 	if info != nil {
@@ -824,6 +869,269 @@ func cmdScreenshotEl(args []string) {
 		fatal("failed to write screenshot: %v", err)
 	}
 	fmt.Printf("Saved %s (%d bytes)\n", file, len(data))
+}
+
+// --- Video recording ---
+
+// startVideo enables video recording: sets state flag and creates frames dir.
+func startVideo() error {
+	s, err := loadState()
+	if err != nil {
+		return err
+	}
+	if s.VideoRecording {
+		return fmt.Errorf("video recording already in progress")
+	}
+	s.VideoDir = filepath.Join(stateDir(), "video-frames")
+	if err := os.MkdirAll(s.VideoDir, 0755); err != nil {
+		return fmt.Errorf("failed to create video dir: %w", err)
+	}
+	s.VideoRecording = true
+	return saveState(s)
+}
+
+func cmdStartVideo(args []string) {
+	if err := startVideo(); err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println("Video recording started")
+}
+
+// VideoResult holds the result of stop-video.
+type VideoResult struct {
+	FrameCount int
+	OutputFile string // empty if ffmpeg not available
+}
+
+// stopVideo stops recording, optionally assembles video, clears state.
+func stopVideo(outputFile string) (*VideoResult, error) {
+	s, err := loadState()
+	if err != nil {
+		return nil, err
+	}
+	if !s.VideoRecording {
+		return nil, fmt.Errorf("video recording is not active (run 'rodney start-video' first)")
+	}
+
+	framesDir := s.VideoDir
+	frameCount := countFrames(framesDir)
+
+	result := &VideoResult{FrameCount: frameCount}
+
+	// Try to assemble video with ffmpeg if we have frames
+	if frameCount > 0 && outputFile != "" {
+		if assembled, err := assembleVideo(framesDir, outputFile); err == nil {
+			result.OutputFile = assembled
+		}
+		// Non-fatal if ffmpeg fails
+	}
+
+	// Clean up: remove frames dir
+	os.RemoveAll(framesDir)
+
+	// Clear state
+	s.VideoRecording = false
+	s.VideoDir = ""
+	saveState(s)
+
+	return result, nil
+}
+
+func cmdStopVideo(args []string) {
+	outputFile := ""
+	if len(args) > 0 {
+		outputFile = args[0]
+	} else {
+		outputFile = nextAvailableFile("recording", ".mp4")
+	}
+
+	result, err := stopVideo(outputFile)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	if result.OutputFile != "" {
+		fmt.Printf("Saved %s (%d frames)\n", result.OutputFile, result.FrameCount)
+	} else if result.FrameCount > 0 {
+		fmt.Printf("Captured %d frames (ffmpeg not available for MP4 assembly)\n", result.FrameCount)
+	} else {
+		fmt.Println("No frames captured")
+	}
+}
+
+// assembleVideo uses ffmpeg to combine frames into an MP4 video.
+// Returns the output file path on success.
+func assembleVideo(framesDir, outputFile string) (string, error) {
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		return "", fmt.Errorf("ffmpeg not found: %w", err)
+	}
+
+	// Read metadata for variable frame timing
+	metaPath := filepath.Join(framesDir, "meta.jsonl")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		// Fallback: use constant framerate
+		return assembleConstantFPS(ffmpeg, framesDir, outputFile)
+	}
+
+	return assembleVariableFPS(ffmpeg, framesDir, outputFile, metaData)
+}
+
+// assembleConstantFPS assembles frames at a fixed 10fps.
+func assembleConstantFPS(ffmpeg, framesDir, outputFile string) (string, error) {
+	cmd := exec.Command(ffmpeg, "-y",
+		"-framerate", "10",
+		"-i", filepath.Join(framesDir, "frame_%06d.jpeg"),
+		"-c:v", "libx264",
+		"-pix_fmt", "yuv420p",
+		"-preset", "fast",
+		outputFile,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("ffmpeg failed: %v: %s", err, output)
+	}
+	return outputFile, nil
+}
+
+// assembleVariableFPS uses ffmpeg concat demuxer with per-frame durations from metadata.
+func assembleVariableFPS(ffmpeg, framesDir, outputFile string, metaData []byte) (string, error) {
+	type frameMeta struct {
+		Idx int     `json:"idx"`
+		Ts  float64 `json:"ts"`
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(metaData)), "\n")
+	var frames []frameMeta
+	for _, line := range lines {
+		var fm frameMeta
+		if err := json.Unmarshal([]byte(line), &fm); err == nil {
+			frames = append(frames, fm)
+		}
+	}
+
+	if len(frames) < 2 {
+		return assembleConstantFPS(ffmpeg, framesDir, outputFile)
+	}
+
+	// Write concat demuxer file
+	concatPath := filepath.Join(framesDir, "concat.txt")
+	f, err := os.Create(concatPath)
+	if err != nil {
+		return assembleConstantFPS(ffmpeg, framesDir, outputFile)
+	}
+	for i, fm := range frames {
+		framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%06d.jpeg", fm.Idx))
+		fmt.Fprintf(f, "file '%s'\n", framePath)
+		if i < len(frames)-1 {
+			dur := frames[i+1].Ts - fm.Ts
+			if dur <= 0 {
+				dur = 0.033
+			}
+			fmt.Fprintf(f, "duration %.6f\n", dur)
+		} else {
+			fmt.Fprintf(f, "duration 0.033\n")
+		}
+	}
+	f.Close()
+
+	cmd := exec.Command(ffmpeg, "-y",
+		"-f", "concat", "-safe", "0",
+		"-i", concatPath,
+		"-c:v", "libx264",
+		"-pix_fmt", "yuv420p",
+		"-preset", "fast",
+		outputFile,
+	)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("ffmpeg failed: %v: %s", err, output)
+	}
+	return outputFile, nil
+}
+
+// startVideoCapture begins CDP screencast on the given page, writing JPEG frames
+// and metadata to framesDir. It returns a stop function that stops the screencast
+// and returns the number of frames captured in this session.
+func startVideoCapture(page *rod.Page, framesDir string) (stop func() int) {
+	os.MkdirAll(framesDir, 0755)
+
+	// Count existing frames to continue numbering
+	startIdx := countFrames(framesDir)
+
+	var mu sync.Mutex
+	captured := 0
+
+	// Open metadata file for appending
+	metaPath := filepath.Join(framesDir, "meta.jsonl")
+	metaFile, err := os.OpenFile(metaPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		// Non-fatal: we can still capture frames without metadata
+		metaFile = nil
+	}
+
+	done := make(chan struct{})
+
+	go page.EachEvent(func(e *proto.PageScreencastFrame) bool {
+		select {
+		case <-done:
+			return true
+		default:
+		}
+
+		mu.Lock()
+		idx := startIdx + captured
+		captured++
+		mu.Unlock()
+
+		framePath := filepath.Join(framesDir, fmt.Sprintf("frame_%06d.jpeg", idx))
+		os.WriteFile(framePath, e.Data, 0644)
+
+		if metaFile != nil && e.Metadata != nil {
+			line := fmt.Sprintf(`{"idx":%d,"ts":%.6f}`+"\n", idx, float64(e.Metadata.Timestamp))
+			mu.Lock()
+			metaFile.WriteString(line)
+			mu.Unlock()
+		}
+
+		proto.PageScreencastFrameAck{SessionID: e.SessionID}.Call(page)
+		return false
+	})()
+
+	quality := 80
+	everyNth := 1
+	proto.PageStartScreencast{
+		Format:        proto.PageStartScreencastFormatJpeg,
+		Quality:       &quality,
+		EveryNthFrame: &everyNth,
+	}.Call(page)
+
+	return func() int {
+		proto.PageStopScreencast{}.Call(page)
+		close(done)
+		// Give in-flight frames a moment to flush
+		time.Sleep(50 * time.Millisecond)
+		if metaFile != nil {
+			metaFile.Close()
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return captured
+	}
+}
+
+// countFrames counts existing frame_NNNNNN.jpeg files in a directory.
+func countFrames(dir string) int {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "frame_") && strings.HasSuffix(e.Name(), ".jpeg") {
+			n++
+		}
+	}
+	return n
 }
 
 func cmdPages(args []string) {

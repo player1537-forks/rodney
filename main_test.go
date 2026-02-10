@@ -2,9 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -42,6 +45,7 @@ func TestMain(m *testing.M) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handleIndex)
 	mux.HandleFunc("/form", handleForm)
+	mux.HandleFunc("/animated", handleAnimated)
 	mux.HandleFunc("/empty", handleEmpty)
 	server := httptest.NewServer(mux)
 
@@ -96,6 +100,19 @@ func handleForm(w http.ResponseWriter, r *http.Request) {
   </form>
 </body>
 </html>`))
+}
+
+func handleAnimated(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	w.Write([]byte(`<!DOCTYPE html>
+<html><head><style>
+.box { width: 50px; height: 50px; background: red; animation: move 1s linear infinite; }
+@keyframes move { 0% { margin-left: 0; } 100% { margin-left: 200px; } }
+</style></head>
+<body><div class="box"></div>
+<div id="c">0</div>
+<script>let n=0; setInterval(()=>{document.getElementById('c').textContent=++n;},100);</script>
+</body></html>`))
 }
 
 func handleEmpty(w http.ResponseWriter, r *http.Request) {
@@ -410,5 +427,339 @@ func TestAXNode_SelectorNotFound(t *testing.T) {
 	_, err := getAXNode(shortPage, "#does-not-exist")
 	if err == nil {
 		t.Error("expected error for nonexistent selector, got nil")
+	}
+}
+
+// =====================
+// Video recording tests
+// =====================
+
+// testStateDir overrides the state dir for test isolation
+func withTestStateDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	origStateDir := stateDirOverride
+	stateDirOverride = dir
+	t.Cleanup(func() { stateDirOverride = origStateDir })
+	return dir
+}
+
+func TestStartVideo_SetsStateFlag(t *testing.T) {
+	dir := withTestStateDir(t)
+
+	// Write a fake state file (simulating a running browser)
+	s := &State{DebugURL: "ws://fake", ChromePID: 99999}
+	if err := saveState(s); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call startVideo
+	if err := startVideo(); err != nil {
+		t.Fatalf("startVideo failed: %v", err)
+	}
+
+	// State should now have VideoRecording=true and a VideoDir
+	s2, err := loadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s2.VideoRecording {
+		t.Error("expected VideoRecording=true")
+	}
+	if s2.VideoDir == "" {
+		t.Error("expected VideoDir to be set")
+	}
+
+	// VideoDir should exist on disk
+	info, err := os.Stat(s2.VideoDir)
+	if err != nil {
+		t.Fatalf("VideoDir does not exist: %v", err)
+	}
+	if !info.IsDir() {
+		t.Error("VideoDir is not a directory")
+	}
+
+	// VideoDir should be under our state dir
+	if !strings.HasPrefix(s2.VideoDir, dir) {
+		t.Errorf("VideoDir %q should be under state dir %q", s2.VideoDir, dir)
+	}
+}
+
+func TestStartVideo_ErrorsIfAlreadyRecording(t *testing.T) {
+	withTestStateDir(t)
+
+	s := &State{DebugURL: "ws://fake", ChromePID: 99999, VideoRecording: true, VideoDir: "/tmp/fake"}
+	saveState(s)
+
+	err := startVideo()
+	if err == nil {
+		t.Error("expected error when already recording")
+	}
+}
+
+func TestVideoCapture_RecordsFramesDuringPageUse(t *testing.T) {
+	dir := withTestStateDir(t)
+	framesDir := filepath.Join(dir, "video-frames")
+
+	// Navigate to a page with animation (generates continuous frames)
+	page := navigateTo(t, "/animated")
+
+	// Start video capture on this page
+	stop := startVideoCapture(page, framesDir)
+
+	// Give screencast time to emit some frames
+	time.Sleep(1 * time.Second)
+
+	// Stop capture and get frame count
+	n := stop()
+
+	if n == 0 {
+		t.Fatal("expected at least 1 frame captured, got 0")
+	}
+
+	// Check frames exist on disk
+	entries, err := os.ReadDir(framesDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jpegCount := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".jpeg" {
+			jpegCount++
+		}
+	}
+	if jpegCount == 0 {
+		t.Fatal("no JPEG files found in frames dir")
+	}
+	if jpegCount != n {
+		t.Errorf("frame count mismatch: stop() returned %d but found %d files", n, jpegCount)
+	}
+
+	// Check metadata file exists
+	metaPath := filepath.Join(framesDir, "meta.jsonl")
+	metaData, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("meta.jsonl not found: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(metaData)), "\n")
+	if len(lines) != n {
+		t.Errorf("meta.jsonl has %d lines, expected %d", len(lines), n)
+	}
+
+	// First frame should be valid JPEG
+	firstFrame, err := os.ReadFile(filepath.Join(framesDir, "frame_000000.jpeg"))
+	if err != nil {
+		t.Fatalf("could not read first frame: %v", err)
+	}
+	if len(firstFrame) < 3 || firstFrame[0] != 0xFF || firstFrame[1] != 0xD8 {
+		t.Error("first frame is not a valid JPEG (missing magic bytes)")
+	}
+}
+
+func TestVideoCapture_AccumulatesAcrossCalls(t *testing.T) {
+	dir := withTestStateDir(t)
+	framesDir := filepath.Join(dir, "video-frames")
+
+	page := navigateTo(t, "/animated")
+
+	// First capture session
+	stop1 := startVideoCapture(page, framesDir)
+	time.Sleep(500 * time.Millisecond)
+	n1 := stop1()
+
+	// Second capture session (should continue numbering)
+	stop2 := startVideoCapture(page, framesDir)
+	time.Sleep(500 * time.Millisecond)
+	n2 := stop2()
+
+	if n1 == 0 || n2 == 0 {
+		t.Fatalf("expected frames from both sessions, got %d and %d", n1, n2)
+	}
+
+	// Total files should be n1 + n2
+	entries, _ := os.ReadDir(framesDir)
+	jpegCount := 0
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".jpeg" {
+			jpegCount++
+		}
+	}
+	if jpegCount != n1+n2 {
+		t.Errorf("expected %d total frames, got %d", n1+n2, jpegCount)
+	}
+}
+
+func TestStopVideo_ClearsStateAndReturnsFrameCount(t *testing.T) {
+	dir := withTestStateDir(t)
+	framesDir := filepath.Join(dir, "video-frames")
+	os.MkdirAll(framesDir, 0755)
+
+	// Simulate some captured frames + metadata
+	for i := 0; i < 5; i++ {
+		// Write minimal JPEG files (just magic bytes for test)
+		os.WriteFile(filepath.Join(framesDir, fmt.Sprintf("frame_%06d.jpeg", i)), []byte{0xFF, 0xD8, 0xFF}, 0644)
+	}
+	metaLines := ""
+	for i := 0; i < 5; i++ {
+		metaLines += fmt.Sprintf(`{"idx":%d,"ts":%f}`+"\n", i, float64(1000+i)*0.016)
+	}
+	os.WriteFile(filepath.Join(framesDir, "meta.jsonl"), []byte(metaLines), 0644)
+
+	s := &State{DebugURL: "ws://fake", ChromePID: 99999, VideoRecording: true, VideoDir: framesDir}
+	saveState(s)
+
+	result, err := stopVideo("")
+	if err != nil {
+		t.Fatalf("stopVideo failed: %v", err)
+	}
+
+	if result.FrameCount != 5 {
+		t.Errorf("expected 5 frames, got %d", result.FrameCount)
+	}
+
+	// State should be cleared
+	s2, err := loadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s2.VideoRecording {
+		t.Error("expected VideoRecording=false after stop")
+	}
+	if s2.VideoDir != "" {
+		t.Error("expected VideoDir to be cleared after stop")
+	}
+}
+
+func TestStopVideo_ErrorsIfNotRecording(t *testing.T) {
+	withTestStateDir(t)
+
+	s := &State{DebugURL: "ws://fake", ChromePID: 99999}
+	saveState(s)
+
+	_, err := stopVideo("")
+	if err == nil {
+		t.Error("expected error when not recording")
+	}
+}
+
+func TestAssembleVideo_ProducesMP4(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+
+	dir := withTestStateDir(t)
+	framesDir := filepath.Join(dir, "video-frames")
+
+	// Capture real frames from an animated page
+	page := navigateTo(t, "/animated")
+	stop := startVideoCapture(page, framesDir)
+	time.Sleep(1 * time.Second)
+	n := stop()
+
+	if n < 2 {
+		t.Fatalf("need at least 2 frames for video, got %d", n)
+	}
+
+	outputFile := filepath.Join(dir, "test-output.mp4")
+	result, err := assembleVideo(framesDir, outputFile)
+	if err != nil {
+		t.Fatalf("assembleVideo failed: %v", err)
+	}
+
+	info, err := os.Stat(result)
+	if err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Error("output file is empty")
+	}
+
+	// Verify it's a real MP4 (starts with ftyp box or moov)
+	header := make([]byte, 12)
+	f, _ := os.Open(result)
+	f.Read(header)
+	f.Close()
+	// MP4 files have "ftyp" at offset 4
+	if string(header[4:8]) != "ftyp" {
+		t.Errorf("output doesn't look like MP4, header: %x", header[:12])
+	}
+}
+
+func TestVideoCapture_WithPageIntegration(t *testing.T) {
+	// Test that withPageVideoCapture starts/stops screencast when recording is on
+	dir := withTestStateDir(t)
+	framesDir := filepath.Join(dir, "video-frames")
+	os.MkdirAll(framesDir, 0755)
+
+	page := navigateTo(t, "/animated")
+
+	// Simulate: recording is active
+	s := &State{
+		DebugURL:       "ws://fake",
+		ChromePID:      99999,
+		VideoRecording: true,
+		VideoDir:       framesDir,
+	}
+	saveState(s)
+
+	// Call the integration hook — same thing withPage() calls
+	cleanup := maybeStartVideoCapture(page)
+
+	time.Sleep(1 * time.Second)
+
+	// Call cleanup (same as what runs via defer in main)
+	cleanup()
+
+	// Frames should have been captured
+	frameCount := countFrames(framesDir)
+	if frameCount == 0 {
+		t.Fatal("expected frames to be captured via maybeStartVideoCapture")
+	}
+}
+
+func TestStopVideo_ProducesMP4WhenFfmpegAvailable(t *testing.T) {
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not available")
+	}
+
+	dir := withTestStateDir(t)
+	framesDir := filepath.Join(dir, "video-frames")
+
+	// Capture real frames from animated page
+	page := navigateTo(t, "/animated")
+	stop := startVideoCapture(page, framesDir)
+	time.Sleep(1 * time.Second)
+	stop()
+
+	// Set up state as if start-video had run
+	s := &State{DebugURL: "ws://fake", ChromePID: 99999, VideoRecording: true, VideoDir: framesDir}
+	saveState(s)
+
+	outputFile := filepath.Join(dir, "result.mp4")
+	result, err := stopVideo(outputFile)
+	if err != nil {
+		t.Fatalf("stopVideo failed: %v", err)
+	}
+
+	if result.OutputFile == "" {
+		t.Error("expected OutputFile to be set")
+	}
+	if result.FrameCount == 0 {
+		t.Error("expected non-zero frame count")
+	}
+
+	// MP4 file should exist
+	info, err := os.Stat(result.OutputFile)
+	if err != nil {
+		t.Fatalf("MP4 file not created: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Error("MP4 file is empty")
+	}
+
+	// Frames dir should be cleaned up
+	if _, err := os.Stat(framesDir); !os.IsNotExist(err) {
+		t.Error("expected frames dir to be removed after stop-video")
 	}
 }
