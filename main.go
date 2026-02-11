@@ -248,6 +248,36 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 
 // --- Commands ---
 
+// findChrome looks for a preinstalled Chrome/Chromium binary to avoid
+// rod's default behavior of auto-downloading one. It checks rod's LookPath
+// (standard system locations) first, then Playwright's cache directory.
+func findChrome() (string, bool) {
+	// Check standard system paths via rod's LookPath
+	if found, ok := launcher.LookPath(); ok {
+		return found, true
+	}
+
+	// Check Playwright's cache for installed Chromium
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", false
+	}
+	cacheDir := filepath.Join(home, ".cache", "ms-playwright")
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "chromium-") && e.IsDir() {
+			bin := filepath.Join(cacheDir, e.Name(), "chrome-linux", "chrome")
+			if _, err := os.Stat(bin); err == nil {
+				return bin, true
+			}
+		}
+	}
+	return "", false
+}
+
 func cmdStart(args []string) {
 	// Check if already running
 	if s, err := loadState(); err == nil {
@@ -271,6 +301,8 @@ func cmdStart(args []string) {
 		UserDataDir(dataDir)
 
 	if bin := os.Getenv("ROD_CHROME_BIN"); bin != "" {
+		l = l.Bin(bin)
+	} else if bin, ok := findChrome(); ok {
 		l = l.Bin(bin)
 	}
 
