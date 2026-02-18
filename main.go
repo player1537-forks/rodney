@@ -1633,20 +1633,11 @@ func cmdLogs(args []string) {
 	}
 
 	if followMode {
-		// Follow mode: print entries as they arrive, block until signal.
+		// Follow mode: print each entry immediately as it arrives.
 		fmt.Fprintln(os.Stderr, "Streaming console logs (Ctrl+C to stop)...")
 
-		// Track how many buffered entries were already printed (for -n handling)
-		// before streaming starts. Since Runtime domain has no buffered replay,
-		// we collect a brief snapshot first, then stream.
-		var mu sync.Mutex
-		var snapshot []consoleEntry
-
 		page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
-			entry := makeConsoleEntry(e)
-			mu.Lock()
-			snapshot = append(snapshot, entry)
-			mu.Unlock()
+			printLogEntry(makeConsoleEntry(e), jsonOutput)
 			return false
 		})
 
@@ -1657,17 +1648,6 @@ func cmdLogs(args []string) {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
-
-		mu.Lock()
-		collected := snapshot
-		mu.Unlock()
-
-		if limitN > 0 && len(collected) > limitN {
-			collected = collected[len(collected)-limitN:]
-		}
-		for _, entry := range collected {
-			printLogEntry(entry, jsonOutput)
-		}
 		return
 	}
 
