@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -269,6 +270,8 @@ func main() {
 		cmdVisible(args)
 	case "assert":
 		cmdAssert(args)
+	case "logs":
+		cmdLogs(args)
 	case "ax-tree":
 		cmdAXTree(args)
 	case "ax-find":
@@ -1491,6 +1494,228 @@ func cmdAssert(args []string) {
 // Ignore SIGPIPE for piped output
 func init() {
 	signal.Ignore(syscall.SIGPIPE)
+}
+
+// --- Console log commands ---
+
+// consoleEntry holds a normalized console log entry.
+type consoleEntry struct {
+	level     string
+	source    string
+	text      string
+	timestamp float64 // Unix milliseconds
+	url       string
+	line      *int
+}
+
+// formatLogLevel formats a proto.LogLogEntryLevel value as a string.
+// Kept for compatibility and unit-testing.
+func formatLogLevel(level proto.LogLogEntryLevel) string {
+	switch level {
+	case proto.LogLogEntryLevelVerbose:
+		return "verbose"
+	case proto.LogLogEntryLevelInfo:
+		return "info"
+	case proto.LogLogEntryLevelWarning:
+		return "warning"
+	case proto.LogLogEntryLevelError:
+		return "error"
+	default:
+		return string(level)
+	}
+}
+
+// consoleTypeToLevel maps a Runtime.consoleAPICalled type to a log level string.
+func consoleTypeToLevel(t proto.RuntimeConsoleAPICalledType) string {
+	switch t {
+	case proto.RuntimeConsoleAPICalledTypeDebug:
+		return "verbose"
+	case proto.RuntimeConsoleAPICalledTypeLog, proto.RuntimeConsoleAPICalledTypeInfo,
+		proto.RuntimeConsoleAPICalledTypeDir, proto.RuntimeConsoleAPICalledTypeDirxml,
+		proto.RuntimeConsoleAPICalledTypeTable, proto.RuntimeConsoleAPICalledTypeTrace,
+		proto.RuntimeConsoleAPICalledTypeStartGroup, proto.RuntimeConsoleAPICalledTypeStartGroupCollapsed,
+		proto.RuntimeConsoleAPICalledTypeEndGroup, proto.RuntimeConsoleAPICalledTypeClear,
+		proto.RuntimeConsoleAPICalledTypeCount, proto.RuntimeConsoleAPICalledTypeTimeEnd,
+		proto.RuntimeConsoleAPICalledTypeProfile, proto.RuntimeConsoleAPICalledTypeProfileEnd:
+		return "info"
+	case proto.RuntimeConsoleAPICalledTypeWarning:
+		return "warning"
+	case proto.RuntimeConsoleAPICalledTypeError, proto.RuntimeConsoleAPICalledTypeAssert:
+		return "error"
+	default:
+		return string(t)
+	}
+}
+
+// formatConsoleArgs converts Runtime RemoteObjects to a human-readable string.
+func formatConsoleArgs(args []*proto.RuntimeRemoteObject) string {
+	var parts []string
+	for _, arg := range args {
+		switch string(arg.Type) {
+		case "string":
+			parts = append(parts, arg.Value.Str())
+		case "number", "boolean":
+			parts = append(parts, arg.Value.JSON("", ""))
+		case "undefined":
+			parts = append(parts, "undefined")
+		case "null":
+			parts = append(parts, "null")
+		default:
+			if arg.Description != "" {
+				parts = append(parts, arg.Description)
+			} else {
+				parts = append(parts, arg.Value.JSON("", ""))
+			}
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func printLogEntry(entry consoleEntry, jsonOutput bool) {
+	if jsonOutput {
+		ts := time.UnixMilli(int64(entry.timestamp)).UTC()
+		obj := map[string]interface{}{
+			"level":     entry.level,
+			"source":    entry.source,
+			"text":      entry.text,
+			"timestamp": ts.Format("2006-01-02T15:04:05.000Z07:00"),
+		}
+		if entry.url != "" {
+			obj["url"] = entry.url
+		}
+		if entry.line != nil {
+			obj["line"] = *entry.line
+		}
+		data, _ := json.Marshal(obj)
+		fmt.Println(string(data))
+	} else {
+		fmt.Printf("[%s] %s\n", entry.level, entry.text)
+	}
+}
+
+func cmdLogs(args []string) {
+	followMode := false
+	jsonOutput := false
+	limitN := -1
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-f", "--follow":
+			followMode = true
+		case "--json":
+			jsonOutput = true
+		case "-n":
+			i++
+			if i >= len(args) {
+				fatal("missing value for -n")
+			}
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 1 {
+				fatal("invalid value for -n: %s", args[i])
+			}
+			limitN = n
+		default:
+			fatal("unknown flag: %s\nusage: rodney logs [-f] [-n N] [--json]", args[i])
+		}
+	}
+
+	s, err := loadState()
+	if err != nil {
+		fatal("%v", err)
+	}
+	browser, err := connectBrowser(s)
+	if err != nil {
+		fatal("%v", err)
+	}
+	page, err := getActivePage(browser, s)
+	if err != nil {
+		fatal("%v", err)
+	}
+
+	if followMode {
+		// Follow mode: print entries as they arrive, block until signal.
+		fmt.Fprintln(os.Stderr, "Streaming console logs (Ctrl+C to stop)...")
+
+		// Track how many buffered entries were already printed (for -n handling)
+		// before streaming starts. Since Runtime domain has no buffered replay,
+		// we collect a brief snapshot first, then stream.
+		var mu sync.Mutex
+		var snapshot []consoleEntry
+
+		page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+			entry := makeConsoleEntry(e)
+			mu.Lock()
+			snapshot = append(snapshot, entry)
+			mu.Unlock()
+			return false
+		})
+
+		if err := (proto.RuntimeEnable{}).Call(page); err != nil {
+			fatal("failed to enable Runtime domain: %v", err)
+		}
+
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+
+		mu.Lock()
+		collected := snapshot
+		mu.Unlock()
+
+		if limitN > 0 && len(collected) > limitN {
+			collected = collected[len(collected)-limitN:]
+		}
+		for _, entry := range collected {
+			printLogEntry(entry, jsonOutput)
+		}
+		return
+	}
+
+	// Snapshot mode: collect events for a brief window then print.
+	var mu sync.Mutex
+	var entries []consoleEntry
+
+	page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		entry := makeConsoleEntry(e)
+		mu.Lock()
+		entries = append(entries, entry)
+		mu.Unlock()
+		return false
+	})
+
+	if err := (proto.RuntimeEnable{}).Call(page); err != nil {
+		fatal("failed to enable Runtime domain: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	mu.Lock()
+	snapshot := entries
+	mu.Unlock()
+
+	if limitN > 0 && len(snapshot) > limitN {
+		snapshot = snapshot[len(snapshot)-limitN:]
+	}
+
+	for _, entry := range snapshot {
+		printLogEntry(entry, jsonOutput)
+	}
+}
+
+func makeConsoleEntry(e *proto.RuntimeConsoleAPICalled) consoleEntry {
+	entry := consoleEntry{
+		level:     consoleTypeToLevel(e.Type),
+		source:    "javascript",
+		text:      formatConsoleArgs(e.Args),
+		timestamp: float64(e.Timestamp),
+	}
+	if e.StackTrace != nil && len(e.StackTrace.CallFrames) > 0 {
+		frame := e.StackTrace.CallFrames[0]
+		entry.url = frame.URL
+		line := frame.LineNumber
+		entry.line = &line
+	}
+	return entry
 }
 
 // --- Accessibility commands ---
