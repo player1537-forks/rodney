@@ -2159,34 +2159,19 @@ func formatAXNodeDetailJSON(node *proto.AccessibilityAXNode) string {
 
 // --- Console logger infrastructure ---
 
-// setupConsoleCapture registers a Runtime.consoleAPICalled listener on the page.
-// Events are always printed to stderr. If s.Logs is true, they are also appended
-// to the per-page NDJSON log file. Returns a cleanup func that waits 50ms for
-// in-flight events to flush and then closes the log file (if open).
+// setupConsoleCapture registers a Runtime.consoleAPICalled listener on the page
+// and prints events to stderr. File writing is handled exclusively by the _logger
+// subprocess to avoid double-writing (Chrome broadcasts events to all CDP sessions).
 func setupConsoleCapture(s *State, page *rod.Page) func() {
-	var logF *os.File
-	if s.Logs {
-		logsDir := filepath.Join(stateDir(), "logs")
-		os.MkdirAll(logsDir, 0755)
-		logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
-		logF, _ = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	}
 	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
 		entry := makeConsoleEntry(e)
 		fmt.Fprintf(os.Stderr, "[%s] %s\n", entry.level, entry.text)
-		if logF != nil {
-			fmt.Fprintln(logF, marshalConsoleEntry(entry))
-			logF.Sync()
-		}
 		return false
 	})
 	(proto.RuntimeEnable{}).Call(page)
 	go wait()
 	return func() {
 		time.Sleep(50 * time.Millisecond) // let EachEvent goroutine flush queued events
-		if logF != nil {
-			logF.Close()
-		}
 	}
 }
 
