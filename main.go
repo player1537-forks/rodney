@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -433,6 +434,8 @@ func cmdStart(args []string) {
 		fatal("failed to save state: %v", err)
 	}
 
+	startBrowserLogger(state)
+
 	fmt.Printf("Chrome started (PID %d)\n", pid)
 	fmt.Printf("Debug URL: %s\n", debugURL)
 }
@@ -565,7 +568,19 @@ func cmdOpen(args []string) {
 	pages, _ := browser.Pages()
 	var page *rod.Page
 	if len(pages) == 0 {
-		page = browser.MustPage(url)
+		if s.Logs {
+			// Create a blank page first so _logger receives TargetTargetCreated and
+			// calls RuntimeEnable before any scripts execute. RuntimeEnable persists
+			// across same-target navigations, so inline scripts on the real URL are
+			// captured. 100ms is ample time for the subprocess round-trips.
+			page = browser.MustPage("")
+			time.Sleep(100 * time.Millisecond)
+			if err := page.Navigate(url); err != nil {
+				fatal("navigation failed: %v", err)
+			}
+		} else {
+			page = browser.MustPage(url)
+		}
 		s.ActivePage = 0
 		saveState(s)
 	} else {
@@ -578,7 +593,6 @@ func cmdOpen(args []string) {
 		}
 	}
 	page.MustWaitLoad()
-	startBrowserLogger(s)
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.Title)
@@ -1290,7 +1304,17 @@ func cmdNewPage(args []string) {
 
 	var page *rod.Page
 	if url != "" {
-		page = browser.MustPage(url)
+		if s.Logs {
+			// Same blank-page-first strategy as cmdOpen: let _logger subscribe and
+			// call RuntimeEnable before the real URL's scripts execute.
+			page = browser.MustPage("")
+			time.Sleep(100 * time.Millisecond)
+			if err := page.Navigate(url); err != nil {
+				fatal("navigation failed: %v", err)
+			}
+		} else {
+			page = browser.MustPage(url)
+		}
 		page.MustWaitLoad()
 	} else {
 		page = browser.MustPage("")
@@ -2180,8 +2204,8 @@ func startBrowserLogger(s *State) {
 }
 
 // cmdInternalLogger is a hidden subcommand: rodney _logger <debugURL> <logsDir>
-// It connects to the running Chrome instance and tracks all pages, writing
-// Runtime.consoleAPICalled events to per-page NDJSON files in logsDir.
+// It connects to the running Chrome instance, enables target discovery, and
+// immediately subscribes to console events on each page as it is created.
 func cmdInternalLogger(args []string) {
 	if len(args) < 2 {
 		fatal("usage: rodney _logger <debugURL> <logsDir>")
@@ -2192,26 +2216,51 @@ func cmdInternalLogger(args []string) {
 	browser := rod.New().ControlURL(debugURL).MustConnect()
 	os.MkdirAll(logsDir, 0755)
 
+	var mu sync.Mutex
 	tracking := map[proto.TargetTargetID]bool{}
+
+	// subscribeToPage marks the target as tracked and starts trackPage in a
+	// goroutine. It looks up the *rod.Page by target ID; retries briefly in
+	// case GetTargets lags slightly behind the TargetCreated event.
+	subscribeToPage := func(targetID proto.TargetTargetID) {
+		mu.Lock()
+		already := tracking[targetID]
+		if !already {
+			tracking[targetID] = true
+		}
+		mu.Unlock()
+		if already {
+			return
+		}
+		go func() {
+			for i := 0; i < 10; i++ {
+				pages, _ := browser.Pages()
+				for _, p := range pages {
+					if p.TargetID == targetID {
+						trackPage(p, logsDir)
+						return
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
+
+	// TargetSetDiscoverTargets causes Chrome to fire TargetTargetCreated for
+	// all existing targets immediately, and for every new target thereafter.
+	// Set up the listener first so we don't miss events.
+	wait := browser.EachEvent(func(e *proto.TargetTargetCreated) bool {
+		if e.TargetInfo.Type == "page" {
+			subscribeToPage(e.TargetInfo.TargetID)
+		}
+		return false
+	})
+	proto.TargetSetDiscoverTargets{Discover: true}.Call(browser)
+	go wait()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-sigCh:
-			return
-		case <-ticker.C:
-			pages, _ := browser.Pages()
-			for _, page := range pages {
-				if !tracking[page.TargetID] {
-					tracking[page.TargetID] = true
-					go trackPage(page, logsDir)
-				}
-			}
-		}
-	}
+	<-sigCh
 }
 
 // trackPage subscribes to console events for a single page and writes them to
