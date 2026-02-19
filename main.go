@@ -420,6 +420,22 @@ func cmdStart(args []string) {
 	// Get Chrome PID from the launcher
 	pid := l.PID()
 
+	// Launch logger subprocess if --logs was specified
+	var loggerPID int
+	if enableLogs {
+		logsDir := filepath.Join(stateDir(), "logs")
+		os.MkdirAll(logsDir, 0755)
+		exe, _ := os.Executable()
+		cmd := exec.Command(exe, "_logger", debugURL, logsDir)
+		setSysProcAttr(cmd)
+		if err := cmd.Start(); err != nil {
+			fatal("failed to start logger: %v", err)
+		}
+		loggerPID = cmd.Process.Pid
+		cmd.Process.Release()
+		fmt.Printf("Logger started (PID %d)\n", loggerPID)
+	}
+
 	state := &State{
 		DebugURL:   debugURL,
 		ChromePID:  pid,
@@ -428,13 +444,12 @@ func cmdStart(args []string) {
 		ProxyPID:   proxyPID,
 		ProxyPort:  proxyPort,
 		Logs:       enableLogs,
+		LoggerPID:  loggerPID,
 	}
 
 	if err := saveState(state); err != nil {
 		fatal("failed to save state: %v", err)
 	}
-
-	startBrowserLogger(state)
 
 	fmt.Printf("Chrome started (PID %d)\n", pid)
 	fmt.Printf("Debug URL: %s\n", debugURL)
@@ -572,9 +587,10 @@ func cmdOpen(args []string) {
 			// Create a blank page first so _logger receives TargetTargetCreated and
 			// calls RuntimeEnable before any scripts execute. RuntimeEnable persists
 			// across same-target navigations, so inline scripts on the real URL are
-			// captured. 100ms is ample time for the subprocess round-trips.
+			// captured. Poll for the log file: trackPage creates it only after
+			// RuntimeEnable returns, so its existence is an exact ready signal.
 			page = browser.MustPage("")
-			time.Sleep(100 * time.Millisecond)
+			waitForLogger(page)
 			if err := page.Navigate(url); err != nil {
 				fatal("navigation failed: %v", err)
 			}
@@ -1305,10 +1321,9 @@ func cmdNewPage(args []string) {
 	var page *rod.Page
 	if url != "" {
 		if s.Logs {
-			// Same blank-page-first strategy as cmdOpen: let _logger subscribe and
-			// call RuntimeEnable before the real URL's scripts execute.
+			// Same blank-page-first strategy as cmdOpen.
 			page = browser.MustPage("")
-			time.Sleep(100 * time.Millisecond)
+			waitForLogger(page)
 			if err := page.Navigate(url); err != nil {
 				fatal("navigation failed: %v", err)
 			}
@@ -2174,35 +2189,6 @@ func formatAXNodeDetailJSON(node *proto.AccessibilityAXNode) string {
 
 // --- Console logger infrastructure ---
 
-// startBrowserLogger spawns a single `rodney _logger` subprocess that stays connected
-// to CDP and writes Runtime.consoleAPICalled events for all pages to NDJSON files.
-// No-op if s.Logs is false or if the logger is already alive.
-func startBrowserLogger(s *State) {
-	if !s.Logs {
-		return
-	}
-	// Idempotency: skip if a logger with the stored PID is still running.
-	if s.LoggerPID > 0 {
-		if proc, err := os.FindProcess(s.LoggerPID); err == nil {
-			if proc.Signal(syscall.Signal(0)) == nil {
-				return // already alive
-			}
-		}
-	}
-	logsDir := filepath.Join(stateDir(), "logs")
-	os.MkdirAll(logsDir, 0755)
-	exe, _ := os.Executable()
-	cmd := exec.Command(exe, "_logger", s.DebugURL, logsDir)
-	setSysProcAttr(cmd)
-	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: failed to start logger: %v\n", err)
-		return
-	}
-	s.LoggerPID = cmd.Process.Pid
-	cmd.Process.Release()
-	saveState(s)
-}
-
 // cmdInternalLogger is a hidden subcommand: rodney _logger <debugURL> <logsDir>
 // It connects to the running Chrome instance, enables target discovery, and
 // immediately subscribes to console events on each page as it is created.
@@ -2265,21 +2251,53 @@ func cmdInternalLogger(args []string) {
 
 // trackPage subscribes to console events for a single page and writes them to
 // a per-page NDJSON file. Blocks until the page is closed or context cancelled.
+//
+// The log file is opened *after* RuntimeEnable returns (which blocks until
+// Chrome acks the command). This means the file's creation on disk is an exact
+// signal that Chrome is ready to send events — waitForLogger relies on this.
 func trackPage(page *rod.Page, logsDir string) {
 	logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
-	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+
+	// Register the listener before enabling so no events are missed.
+	// f starts nil; callback skips writes until f is set below.
+	var f *os.File
+	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		if f != nil {
+			fmt.Fprintln(f, marshalConsoleEntry(makeConsoleEntry(e)))
+			f.Sync()
+		}
+		return false
+	})
+
+	// Enable runtime; blocks until Chrome acknowledges.
+	if err := (proto.RuntimeEnable{}).Call(page); err != nil {
+		return
+	}
+
+	// Open the log file now. Its appearance on disk is the ready signal
+	// consumed by waitForLogger in cmdOpen/cmdNewPage.
+	var err error
+	f, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		return
 	}
 	defer f.Close()
 
-	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
-		fmt.Fprintln(f, marshalConsoleEntry(makeConsoleEntry(e)))
-		f.Sync()
-		return false
-	})
-	(proto.RuntimeEnable{}).Call(page)
-	wait() // blocks until page closed or context cancelled
+	wait() // blocks until page closed or context cancelled; f is non-nil
+}
+
+// waitForLogger polls until _logger has subscribed to page and called
+// RuntimeEnable (signalled by the log file appearing on disk), or until a
+// 500ms timeout expires. Called before navigating a freshly-created blank page.
+func waitForLogger(page *rod.Page) {
+	logFile := filepath.Join(stateDir(), "logs", string(page.TargetID)+".ndjson")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(logFile); err == nil {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // --- Auth proxy for environments with authenticated HTTP proxies ---

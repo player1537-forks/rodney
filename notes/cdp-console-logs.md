@@ -8,11 +8,10 @@ Research and empirical testing done while implementing `rodney logs`.
 
 - Fires for every `console.log/warn/error/debug/info/...` call made by JavaScript
   running in the page, including calls made via `Runtime.evaluate`
-- **Live only** — no cross-session replay
+- **Live only** — no replay of past events
 - When `Runtime.enable` is called in a new CDP session, Chrome does *not* replay
   previous `consoleAPICalled` events to that session
-- This is what rodney uses for **follow mode** (`rodney logs -f`) and what
-  Playwright uses for `page.on('console')`
+- This is what rodney uses for all console capture
 
 ### 2. `Log.entryAdded` (Log domain)
 
@@ -21,137 +20,116 @@ Research and empirical testing done while implementing `rodney logs`.
 - Does **not** fire for JavaScript `console.*` API calls (those go exclusively
   to `Runtime.consoleAPICalled`)
 - `Log.enable` does replay buffered browser-level entries to new sessions
-- This is what rodney uses for **snapshot mode** (`rodney logs`)
 
 ### 3. `Console.messageAdded` (Console domain — deprecated)
 
 - The older, deprecated predecessor to the Runtime + Log split
 - Replays collected messages on `Console.enable`, per the CDP spec
-- In practice (Chrome ~124+) empirically found to replay 0 messages, consistent
-  with the Log domain behaviour above
+- In practice (Chrome ~124+) empirically found to replay 0 messages
 - Playwright never uses this domain
 
-## Why `rodney js "console.log(...)"` doesn't appear in `rodney logs`
+## Key discovery: `Runtime.consoleAPICalled` IS broadcast cross-session
 
-Each `rodney` invocation is a **separate OS process with a separate CDP session**.
-
-When `rodney js "console.log('hello')"` runs:
-1. A new CDP session is opened
-2. `Runtime.evaluate` is called — `console.log` fires
-3. The session disconnects
-
-When `rodney logs` runs next:
-1. A new CDP session is opened
-2. `Runtime.enable` is called
-3. Chrome does **not** replay the previous session's `consoleAPICalled` events
-
-There is no CDP mechanism that makes cross-session `console.*` replay possible.
-We tested and confirmed: `Runtime.disable` + `Runtime.enable`, `Log.enable`, and
-`Console.enable` all return 0 events for messages produced by a prior session's
+Empirically confirmed: `Runtime.consoleAPICalled` events are broadcast to **all**
+CDP sessions that have called `Runtime.enable` on the same target, regardless of
+which session triggered the event. This includes events triggered by
 `Runtime.evaluate`.
 
-## How Playwright avoids this problem
+This was confirmed by observing double-writes to the NDJSON log file when both
+a `_logger` subprocess and an in-process EachEvent handler were listening
+simultaneously — both received the same event.
 
-Playwright maintains a **persistent CDP connection** for the entire test/automation
-lifetime. `page.on('console')` hooks into `Runtime.consoleAPICalled` on that
-same persistent session, so it captures every `console.*` call — including those
-from `page.evaluate(...)` — because they all happen within the same session.
+Consequence: the background `_logger` subprocess **can** capture console calls
+made through `rodney js`, as long as it has called `Runtime.enable` before those
+calls happen.
 
-Relevant detail from Playwright source (`crPage.ts`): when `Runtime.enable` is
-first called, Chrome *does* replay the last ~1000 console messages with
-`executionContextId = 0`. Playwright explicitly **drops** these replays because
-(a) the original execution context is gone so args can't be inspected, and
-(b) they arrive before user listeners are registered anyway.
+## Timing constraint: inline scripts race against subscription
 
-```typescript
-// crPage.ts – FrameSession._onConsoleAPI
-if (event.executionContextId === 0) {
-  // DevTools protocol stores the last 1000 console messages…
-  // Ignore these messages since there's no execution context we can use.
-  return;
-}
+`Runtime.consoleAPICalled` is live-only — events fired before a session calls
+`Runtime.enable` are not replayed. This creates a race for pages that call
+`console.*` synchronously in inline scripts:
+
+```html
+<script>console.log("fires during page load")</script>
 ```
 
-## Considered workaround: JS interceptor
+If the `_logger` process is polling for new pages (100ms intervals), it will
+almost always miss inline-script console calls because the page loads before
+`_logger` subscribes.
 
-We briefly implemented a `window.__rodney_logs` buffer — `rodney logs` would
-inject an override of `console.*` that stores entries in `window.__rodney_logs`,
-and subsequent invocations would read and clear that buffer.
+## Current implementation: `_logger` subprocess with `Target.targetCreated`
 
-This worked but was rejected because:
-- It mutates the page's JavaScript environment
-- It only captures messages after the first `rodney logs` invocation
-- It feels wrong for a debugging tool to modify what it observes
+`rodney start --logs` spawns a `_logger` subprocess immediately. It uses
+`Target.setDiscoverTargets` + `EachEvent(TargetTargetCreated)` to detect new
+pages the moment Chrome creates their target — microseconds after creation,
+before navigation begins.
 
-## Key discovery: `Runtime.consoleAPICalled` is NOT broadcast cross-session
+To close the remaining race for inline scripts, `cmdOpen` and `cmdNewPage`
+use a blank-page-first strategy when `--logs` is active:
 
-Empirically confirmed: when Session A calls `Runtime.evaluate` and the evaluated
-code calls `console.log`, Chrome delivers the `Runtime.consoleAPICalled` event
-**only to Session A**. A separate Session B with `Runtime.enable` active on the
-same page target does **not** receive the event.
+1. Create a blank page (`browser.MustPage("")`) — triggers `TargetTargetCreated`
+   in `_logger` immediately
+2. `_logger` calls `RuntimeEnable` on the blank page; `RuntimeEnable` is a
+   synchronous CDP call that blocks until Chrome acknowledges — after it returns,
+   Chrome will send events for any subsequent console call on this target
+3. `_logger`'s `trackPage` opens the `.ndjson` log file *after* `RuntimeEnable`
+   returns — the file's appearance on disk is an exact ready signal
+4. `cmdOpen` polls (`waitForLogger`) for the log file to appear (5ms intervals,
+   500ms timeout) — typically resolves in ~10–15ms
+5. `cmdOpen` navigates to the real URL — `RuntimeEnable` persists across
+   same-target navigations, so all inline scripts are captured
 
-This means the background `_logger` approach (which connects via its own CDP
-session) **cannot capture `console.log` calls made through `rodney js`**.
+`rodney logs` requires `rodney start --logs`; it errors with a helpful message
+otherwise.
 
-Page-native console calls (inline scripts, timers, event handlers — anything
-that runs outside of `Runtime.evaluate`) *are* broadcast to all sessions with
-Runtime enabled. So the logger does capture those, just not CDP-evaluate events.
+### What `_logger` captures
 
-Test used to confirm (simplified):
-```go
-// Session A: registers EachEvent + RuntimeEnable, blocks waiting for events
-// Session B: calls page.MustEval(`() => { console.log("cross-session-test") }`)
-// Result: Session A receives nothing → timeout
-```
+| Source | Captured |
+|--------|----------|
+| Inline `<script>` on page load | ✓ (via blank-page-first) |
+| `setTimeout` / async callbacks | ✓ |
+| User interaction handlers | ✓ |
+| `rodney js "console.log(...)"` | ✓ (cross-session broadcast confirmed) |
 
-## Considered alternative: Chrome `--enable-logging` file
+### What `_logger` cannot capture
+
+- Console calls that fired **before** `_logger` subscribed on an existing page
+  (e.g. if `rodney open` was called without `--logs` and later logs are enabled
+  — the page's runtime was never enabled in the logger session)
+
+## Considered and rejected approaches
+
+### In-process capture in `cmdJS`
+
+Briefly implemented: `cmdJS` registered an `EachEvent` handler in-process before
+evaluating, wrote to the NDJSON file directly. Removed because:
+- When combined with `_logger`, every event was written twice (both sessions
+  receive the broadcast)
+- Adding `s.Logs` guards made the logic conditional and error-prone
+- `_logger` alone is sufficient since the cross-session broadcast works
+
+### JS interceptor (`window.__rodney_logs`)
+
+Briefly implemented: `rodney logs` injected `console.*` overrides that buffered
+to `window.__rodney_logs`; subsequent invocations read and cleared the buffer.
+
+Rejected because:
+- Mutates the page's JavaScript environment
+- Only captures messages after the first `rodney logs` invocation
+- Feels wrong for a debugging tool to modify what it observes
+
+### Chrome `--enable-logging` file
 
 Chrome supports `--enable-logging --log-level=0` which writes all JavaScript
-`console.*` calls to `<userDataDir>/chrome_debug.log`, regardless of which CDP
-session triggered them. This solves the cross-session problem entirely.
+`console.*` calls to `<userDataDir>/chrome_debug.log`.
 
-Log line format:
-```
-[PID:TID:DATE:INFO:CONSOLE(N)] "message text", source: https://example.com (42)
-```
+Rejected because:
+- All levels map to `INFO:CONSOLE` — no severity info
+- Single file for entire browser session, not per-page
+- Requires baking the flag into `rodney start`
 
-Empirically confirmed (Chrome ~128):
-- Captures `console.log`, `console.warn`, `console.error` from inline scripts ✓
-- Captures `console.log` fired via `Runtime.evaluate` in a separate session ✓
-- All levels (`log`, `warn`, `error`) map to `INFO:CONSOLE` — **no severity info** ✗
-- Single file for the entire browser session — not scoped per page ✗
-  (URL in the `source:` field enables filtering, but adds complexity)
-- Requires baking `--enable-logging` into `rodney start` ✗
+## Log file location
 
-Rejected because losing level info (`[info]`/`[warning]`/`[error]`) is a
-meaningful regression, and the per-page scoping would need extra work.
-Preserved here as a viable fallback if the current approach proves insufficient.
-
-## Current implementation (in-process capture in `cmdJS`)
-
-The background `_logger` subprocess approach was implemented and then removed.
-It was unnecessary because the primary use case — capturing `console.*` calls
-made via `rodney js` — cannot be served by a separate CDP session anyway (see
-"Key discovery" above). Page-native console events between CLI invocations are
-not a common enough use case to justify the complexity.
-
-Instead, `rodney js` captures console events **in-process**, within the same CDP
-session that runs the `Runtime.evaluate` call:
-
-1. Before evaluating, open (or create) `<stateDir>/logs/<targetID>.ndjson`
-2. Register an `EachEvent` handler for `Runtime.consoleAPICalled`
-3. Enable the Runtime domain and start the event loop (`go wait()`)
-4. Evaluate the JS expression
-5. Sleep 50 ms to let the event goroutine flush any queued events
-6. Close the log file
-
-`rodney logs` reads the NDJSON file directly — no CDP session required.
-
-| Mode | Mechanism | What it captures |
-|------|-----------|-----------------|
-| `rodney logs` | Read NDJSON file | All `console.*` calls made via `rodney js` |
-| `rodney logs -f` | Tail NDJSON file | Same, plus new entries as they arrive |
-| `rodney logs -n N` | Read last N lines from NDJSON file | Last N `console.*` calls |
-
-Log files live at `<stateDir>/logs/<targetID>.ndjson` and persist until the
-state directory is cleaned up manually or a new session is started.
+`<stateDir>/logs/<targetID>.ndjson` — one file per page target. Files persist
+until the state directory is cleaned manually or a new session is started.
+TargetIDs change each Chrome session, so old files from prior sessions are inert.
