@@ -2,6 +2,7 @@ package main
 
 import (
 	_ "embed"
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -1703,29 +1704,44 @@ func cmdLogs(args []string) {
 		return
 	}
 
-	// Snapshot mode: read NDJSON file
-	lines := readLogLines(logFile)
-	if limitN > 0 && len(lines) > limitN {
-		lines = lines[len(lines)-limitN:]
-	}
-	for _, line := range lines {
-		printNDJSONLine(line, jsonOutput)
+	// Snapshot mode: stream the file to avoid loading it all into memory.
+	if limitN > 0 {
+		// Ring buffer: O(limitN) memory regardless of file size.
+		ring := make([]string, limitN)
+		count := 0
+		scanLogFile(logFile, func(line string) {
+			ring[count%limitN] = line
+			count++
+		})
+		start, n := 0, count
+		if count > limitN {
+			start = count % limitN
+			n = limitN
+		}
+		for i := 0; i < n; i++ {
+			printNDJSONLine(ring[(start+i)%limitN], jsonOutput)
+		}
+	} else {
+		scanLogFile(logFile, func(line string) {
+			printNDJSONLine(line, jsonOutput)
+		})
 	}
 }
 
-// readLogLines reads an NDJSON log file and returns non-empty lines.
-func readLogLines(logFile string) []string {
-	data, err := os.ReadFile(logFile)
+// scanLogFile opens logFile and calls fn for each non-empty line using a
+// streaming bufio.Scanner — no whole-file read into memory.
+func scanLogFile(logFile string, fn func(string)) {
+	f, err := os.Open(logFile)
 	if err != nil {
-		return nil
+		return
 	}
-	var lines []string
-	for _, line := range strings.Split(string(data), "\n") {
-		if line != "" {
-			lines = append(lines, line)
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		if line := scanner.Text(); line != "" {
+			fn(line)
 		}
 	}
-	return lines
 }
 
 // printNDJSONLine prints a single NDJSON log line.
@@ -1755,17 +1771,27 @@ func tailLogFile(logFile string, limitN int, jsonOutput bool) {
 	defer f.Close()
 
 	if limitN > 0 {
-		// Read current content, print last N lines, then seek to end
-		data, _ := io.ReadAll(f)
-		lines := readNDJSONLines(string(data))
-		if len(lines) > limitN {
-			lines = lines[len(lines)-limitN:]
+		// Ring buffer: stream last N lines without loading the whole file.
+		ring := make([]string, limitN)
+		count := 0
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			if line := scanner.Text(); line != "" {
+				ring[count%limitN] = line
+				count++
+			}
 		}
-		for _, line := range lines {
-			printNDJSONLine(line, jsonOutput)
+		start, n := 0, count
+		if count > limitN {
+			start = count % limitN
+			n = limitN
+		}
+		for i := 0; i < n; i++ {
+			printNDJSONLine(ring[(start+i)%limitN], jsonOutput)
 		}
 	}
-	// Seek to end to tail only new content
+	// Seek to end to tail only new content (scanner may have over-read into
+	// a bufio buffer, but explicit SeekEnd corrects the OS file position).
 	f.Seek(0, io.SeekEnd)
 
 	sigCh := make(chan os.Signal, 1)
@@ -1797,17 +1823,6 @@ func tailLogFile(logFile string, limitN int, jsonOutput bool) {
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-}
-
-// readNDJSONLines splits a string into non-empty lines.
-func readNDJSONLines(content string) []string {
-	var lines []string
-	for _, line := range strings.Split(content, "\n") {
-		if line != "" {
-			lines = append(lines, line)
-		}
-	}
-	return lines
 }
 
 func makeConsoleEntry(e *proto.RuntimeConsoleAPICalled) consoleEntry {

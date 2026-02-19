@@ -1294,7 +1294,7 @@ func TestLogs_ConsoleTypeToLevel(t *testing.T) {
 	}
 }
 
-func TestLogs_ReadLogLines(t *testing.T) {
+func TestLogs_ScanLogFile(t *testing.T) {
 	dir := t.TempDir()
 	logFile := filepath.Join(dir, "test.ndjson")
 
@@ -1305,7 +1305,8 @@ func TestLogs_ReadLogLines(t *testing.T) {
 		t.Fatalf("failed to write log file: %v", err)
 	}
 
-	lines := readLogLines(logFile)
+	var lines []string
+	scanLogFile(logFile, func(line string) { lines = append(lines, line) })
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 lines, got %d: %v", len(lines), lines)
 	}
@@ -1326,19 +1327,5 @@ func TestLogs_ReadLogLines(t *testing.T) {
 	}
 	if obj.Level != "warning" || obj.Text != "world" {
 		t.Errorf("line 1: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "warning", "world")
-	}
-
-	// Verify -n slicing works correctly
-	if len(lines) > 1 {
-		tail := lines[len(lines)-1:]
-		if len(tail) != 1 {
-			t.Errorf("tail slice expected 1 line, got %d", len(tail))
-		}
-		if err := json.Unmarshal([]byte(tail[0]), &obj); err != nil {
-			t.Fatalf("failed to unmarshal tail line: %v", err)
-		}
-		if obj.Level != "warning" || obj.Text != "world" {
-			t.Errorf("tail: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "warning", "world")
-		}
 	}
 }
