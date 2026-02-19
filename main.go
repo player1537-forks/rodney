@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -724,9 +723,32 @@ func cmdJS(args []string) {
 	expr := strings.Join(args, " ")
 	_, _, page := withPage()
 
+	// Capture console.* events in-process and append to the per-page NDJSON log file.
+	// Chrome does not broadcast Runtime.consoleAPICalled cross-session, so we must
+	// capture them here within the same CDP session as the evaluate call.
+	logsDir := filepath.Join(stateDir(), "logs")
+	os.MkdirAll(logsDir, 0755)
+	logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
+	logF, _ := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if logF != nil {
+		wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+			fmt.Fprintln(logF, marshalConsoleEntry(makeConsoleEntry(e)))
+			logF.Sync()
+			return false
+		})
+		(proto.RuntimeEnable{}).Call(page)
+		go wait()
+	}
+
 	// Wrap bare expressions in a function
 	js := fmt.Sprintf(`() => { return (%s); }`, expr)
 	result, err := page.Eval(js)
+
+	if logF != nil {
+		time.Sleep(50 * time.Millisecond) // let the EachEvent goroutine flush queued events
+		logF.Close()
+	}
+
 	if err != nil {
 		fatal("JS error: %v", err)
 	}
@@ -1632,54 +1654,124 @@ func cmdLogs(args []string) {
 		fatal("%v", err)
 	}
 
+	logFile := filepath.Join(stateDir(), "logs", string(page.TargetID)+".ndjson")
+
+	if _, err := os.Stat(logFile); os.IsNotExist(err) {
+		fmt.Fprintln(os.Stderr, "no console log recorded for this page yet")
+		os.Exit(0)
+	}
+
 	if followMode {
-		// Follow mode: print each entry immediately as it arrives.
 		fmt.Fprintln(os.Stderr, "Streaming console logs (Ctrl+C to stop)...")
-
-		page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
-			printLogEntry(makeConsoleEntry(e), jsonOutput)
-			return false
-		})
-
-		if err := (proto.RuntimeEnable{}).Call(page); err != nil {
-			fatal("failed to enable Runtime domain: %v", err)
-		}
-
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
+		tailLogFile(logFile, limitN, jsonOutput)
 		return
 	}
 
-	// Snapshot mode: collect events for a brief window then print.
-	var mu sync.Mutex
-	var entries []consoleEntry
-
-	page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
-		entry := makeConsoleEntry(e)
-		mu.Lock()
-		entries = append(entries, entry)
-		mu.Unlock()
-		return false
-	})
-
-	if err := (proto.RuntimeEnable{}).Call(page); err != nil {
-		fatal("failed to enable Runtime domain: %v", err)
+	// Snapshot mode: read NDJSON file
+	lines := readLogLines(logFile)
+	if limitN > 0 && len(lines) > limitN {
+		lines = lines[len(lines)-limitN:]
 	}
-
-	time.Sleep(100 * time.Millisecond)
-
-	mu.Lock()
-	snapshot := entries
-	mu.Unlock()
-
-	if limitN > 0 && len(snapshot) > limitN {
-		snapshot = snapshot[len(snapshot)-limitN:]
+	for _, line := range lines {
+		printNDJSONLine(line, jsonOutput)
 	}
+}
 
-	for _, entry := range snapshot {
-		printLogEntry(entry, jsonOutput)
+// readLogLines reads an NDJSON log file and returns non-empty lines.
+func readLogLines(logFile string) []string {
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		return nil
 	}
+	var lines []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// printNDJSONLine prints a single NDJSON log line.
+// In JSON mode it prints verbatim; otherwise it formats as "[level] text".
+func printNDJSONLine(line string, jsonOutput bool) {
+	if jsonOutput {
+		fmt.Println(line)
+		return
+	}
+	var obj struct {
+		Level string `json:"level"`
+		Text  string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(line), &obj); err == nil {
+		fmt.Printf("[%s] %s\n", obj.Level, obj.Text)
+	}
+}
+
+// tailLogFile follows a log file, printing new lines as they are appended.
+// If limitN > 0, prints the last N existing lines first, then follows new content.
+// If limitN <= 0, seeks to the end immediately and only shows new entries.
+func tailLogFile(logFile string, limitN int, jsonOutput bool) {
+	f, err := os.Open(logFile)
+	if err != nil {
+		fatal("failed to open log file: %v", err)
+	}
+	defer f.Close()
+
+	if limitN > 0 {
+		// Read current content, print last N lines, then seek to end
+		data, _ := io.ReadAll(f)
+		lines := readNDJSONLines(string(data))
+		if len(lines) > limitN {
+			lines = lines[len(lines)-limitN:]
+		}
+		for _, line := range lines {
+			printNDJSONLine(line, jsonOutput)
+		}
+	}
+	// Seek to end to tail only new content
+	f.Seek(0, io.SeekEnd)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	buf := make([]byte, 4096)
+	var partial string
+	for {
+		select {
+		case <-sigCh:
+			return
+		default:
+		}
+		n, _ := f.Read(buf)
+		if n > 0 {
+			partial += string(buf[:n])
+			for {
+				idx := strings.Index(partial, "\n")
+				if idx < 0 {
+					break
+				}
+				line := partial[:idx]
+				partial = partial[idx+1:]
+				if line != "" {
+					printNDJSONLine(line, jsonOutput)
+				}
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+}
+
+// readNDJSONLines splits a string into non-empty lines.
+func readNDJSONLines(content string) []string {
+	var lines []string
+	for _, line := range strings.Split(content, "\n") {
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 func makeConsoleEntry(e *proto.RuntimeConsoleAPICalled) consoleEntry {
@@ -1697,6 +1789,26 @@ func makeConsoleEntry(e *proto.RuntimeConsoleAPICalled) consoleEntry {
 	}
 	return entry
 }
+
+// marshalConsoleEntry serializes a consoleEntry to a JSON line for the NDJSON log file.
+func marshalConsoleEntry(entry consoleEntry) string {
+	ts := time.UnixMilli(int64(entry.timestamp)).UTC()
+	obj := map[string]interface{}{
+		"level":     entry.level,
+		"source":    entry.source,
+		"text":      entry.text,
+		"timestamp": ts.Format("2006-01-02T15:04:05.000Z07:00"),
+	}
+	if entry.url != "" {
+		obj["url"] = entry.url
+	}
+	if entry.line != nil {
+		obj["line"] = *entry.line
+	}
+	data, _ := json.Marshal(obj)
+	return string(data)
+}
+
 
 // --- Accessibility commands ---
 

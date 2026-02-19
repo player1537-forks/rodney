@@ -1253,6 +1253,7 @@ func TestLogs_ConsoleTypes(t *testing.T) {
 	}
 }
 
+
 func TestLogs_FormatLogLevel(t *testing.T) {
 	tests := []struct {
 		level    proto.LogLogEntryLevel
@@ -1289,6 +1290,55 @@ func TestLogs_ConsoleTypeToLevel(t *testing.T) {
 		got := consoleTypeToLevel(tt.ct)
 		if got != tt.expected {
 			t.Errorf("consoleTypeToLevel(%q) = %q, want %q", tt.ct, got, tt.expected)
+		}
+	}
+}
+
+func TestLogs_ReadLogLines(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "test.ndjson")
+
+	content := `{"level":"info","source":"javascript","text":"hello","timestamp":"2024-01-01T12:00:00.000Z"}
+{"level":"warning","source":"javascript","text":"world","timestamp":"2024-01-01T12:00:01.000Z"}
+`
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatalf("failed to write log file: %v", err)
+	}
+
+	lines := readLogLines(logFile)
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 lines, got %d: %v", len(lines), lines)
+	}
+
+	var obj struct {
+		Level string `json:"level"`
+		Text  string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &obj); err != nil {
+		t.Fatalf("failed to unmarshal line 0: %v", err)
+	}
+	if obj.Level != "info" || obj.Text != "hello" {
+		t.Errorf("line 0: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "info", "hello")
+	}
+
+	if err := json.Unmarshal([]byte(lines[1]), &obj); err != nil {
+		t.Fatalf("failed to unmarshal line 1: %v", err)
+	}
+	if obj.Level != "warning" || obj.Text != "world" {
+		t.Errorf("line 1: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "warning", "world")
+	}
+
+	// Verify -n slicing works correctly
+	if len(lines) > 1 {
+		tail := lines[len(lines)-1:]
+		if len(tail) != 1 {
+			t.Errorf("tail slice expected 1 line, got %d", len(tail))
+		}
+		if err := json.Unmarshal([]byte(tail[0]), &obj); err != nil {
+			t.Fatalf("failed to unmarshal tail line: %v", err)
+		}
+		if obj.Level != "warning" || obj.Text != "world" {
+			t.Errorf("tail: got level=%q text=%q, want level=%q text=%q", obj.Level, obj.Text, "warning", "world")
 		}
 	}
 }
