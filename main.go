@@ -333,7 +333,7 @@ func parseStartFlags(args []string) (startFlags, error) {
 		case "--insecure", "-k":
 			f.ignoreCertErrors = true
 		default:
-			return f, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure]", arg)
+			return f, fmt.Errorf("unknown flag: %s\nusage: rodney start [--show] [--insecure | -k]", arg)
 		}
 	}
 	return f, nil
