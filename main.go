@@ -82,8 +82,10 @@ type State struct {
 	ChromePID   int    `json:"chrome_pid"`
 	ActivePage  int    `json:"active_page"`  // index into pages list
 	DataDir     string `json:"data_dir"`
-	ProxyPID    int    `json:"proxy_pid,omitempty"`  // PID of auth proxy helper
-	ProxyPort   int    `json:"proxy_port,omitempty"` // local port of auth proxy
+	ProxyPID    int    `json:"proxy_pid,omitempty"`   // PID of auth proxy helper
+	ProxyPort   int    `json:"proxy_port,omitempty"`  // local port of auth proxy
+	Logs        bool   `json:"logs,omitempty"`        // console log capture enabled
+	LoggerPID   int    `json:"logger_pid,omitempty"`  // PID of _logger subprocess
 }
 
 func stateDir() string {
@@ -189,6 +191,8 @@ func main() {
 	switch cmd {
 	case "_proxy":
 		cmdInternalProxy(args) // hidden: runs the auth proxy helper
+	case "_logger":
+		cmdInternalLogger(args) // hidden: runs the browser console logger
 	case "start":
 		cmdStart(args)
 	case "connect":
@@ -322,12 +326,15 @@ func withPage() (*State, *rod.Browser, *rod.Page) {
 
 func cmdStart(args []string) {
 	ignoreCertErrors := false
+	enableLogs := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--insecure", "-k":
 			ignoreCertErrors = true
+		case "--logs":
+			enableLogs = true
 		default:
-			fatal("unknown flag: %s\nusage: rodney start [--insecure]", args[i])
+			fatal("unknown flag: %s\nusage: rodney start [--insecure] [--logs]", args[i])
 		}
 	}
 
@@ -419,6 +426,7 @@ func cmdStart(args []string) {
 		DataDir:    dataDir,
 		ProxyPID:   proxyPID,
 		ProxyPort:  proxyPort,
+		Logs:       enableLogs,
 	}
 
 	if err := saveState(state); err != nil {
@@ -500,6 +508,12 @@ func cmdStop(args []string) {
 			proc.Signal(syscall.SIGTERM)
 		}
 	}
+	// Kill the logger subprocess if running
+	if s.LoggerPID > 0 {
+		if proc, err := os.FindProcess(s.LoggerPID); err == nil {
+			proc.Signal(syscall.SIGTERM)
+		}
+	}
 	removeState()
 	fmt.Println("Chrome stopped")
 }
@@ -564,6 +578,7 @@ func cmdOpen(args []string) {
 		}
 	}
 	page.MustWaitLoad()
+	startBrowserLogger(s)
 	info, _ := page.Info()
 	if info != nil {
 		fmt.Println(info.Title)
@@ -721,33 +736,18 @@ func cmdJS(args []string) {
 		fatal("usage: rodney js <expression>")
 	}
 	expr := strings.Join(args, " ")
-	_, _, page := withPage()
+	s, _, page := withPage()
 
-	// Capture console.* events in-process and append to the per-page NDJSON log file.
-	// Chrome does not broadcast Runtime.consoleAPICalled cross-session, so we must
-	// capture them here within the same CDP session as the evaluate call.
-	logsDir := filepath.Join(stateDir(), "logs")
-	os.MkdirAll(logsDir, 0755)
-	logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
-	logF, _ := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if logF != nil {
-		wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
-			fmt.Fprintln(logF, marshalConsoleEntry(makeConsoleEntry(e)))
-			logF.Sync()
-			return false
-		})
-		(proto.RuntimeEnable{}).Call(page)
-		go wait()
-	}
+	// Capture console.* events: always prints to stderr; also writes to NDJSON if --logs enabled.
+	// Chrome does not broadcast Runtime.consoleAPICalled cross-session for evaluate calls,
+	// so we must capture them here within the same CDP session.
+	cleanup := setupConsoleCapture(s, page)
 
 	// Wrap bare expressions in a function
 	js := fmt.Sprintf(`() => { return (%s); }`, expr)
 	result, err := page.Eval(js)
 
-	if logF != nil {
-		time.Sleep(50 * time.Millisecond) // let the EachEvent goroutine flush queued events
-		logF.Close()
-	}
+	cleanup()
 
 	if err != nil {
 		fatal("JS error: %v", err)
@@ -1466,10 +1466,12 @@ func cmdAssert(args []string) {
 		fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
 	}
 
-	_, _, page := withPage()
+	s, _, page := withPage()
 
+	cleanup := setupConsoleCapture(s, page)
 	js := fmt.Sprintf(`() => { return (%s); }`, expr)
 	result, err := page.Eval(js)
+	cleanup()
 	if err != nil {
 		fatal("JS error: %v", err)
 	}
@@ -1644,6 +1646,10 @@ func cmdLogs(args []string) {
 	s, err := loadState()
 	if err != nil {
 		fatal("%v", err)
+	}
+	if !s.Logs {
+		fmt.Fprintln(os.Stderr, "logs not enabled (run: rodney start --logs)")
+		os.Exit(1)
 	}
 	browser, err := connectBrowser(s)
 	if err != nil {
@@ -2149,6 +2155,122 @@ func formatAXNodeDetailJSON(node *proto.AccessibilityAXNode) string {
 		return "{}"
 	}
 	return string(data)
+}
+
+// --- Console logger infrastructure ---
+
+// setupConsoleCapture registers a Runtime.consoleAPICalled listener on the page.
+// Events are always printed to stderr. If s.Logs is true, they are also appended
+// to the per-page NDJSON log file. Returns a cleanup func that waits 50ms for
+// in-flight events to flush and then closes the log file (if open).
+func setupConsoleCapture(s *State, page *rod.Page) func() {
+	var logF *os.File
+	if s.Logs {
+		logsDir := filepath.Join(stateDir(), "logs")
+		os.MkdirAll(logsDir, 0755)
+		logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
+		logF, _ = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	}
+	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		entry := makeConsoleEntry(e)
+		fmt.Fprintf(os.Stderr, "[%s] %s\n", entry.level, entry.text)
+		if logF != nil {
+			fmt.Fprintln(logF, marshalConsoleEntry(entry))
+			logF.Sync()
+		}
+		return false
+	})
+	(proto.RuntimeEnable{}).Call(page)
+	go wait()
+	return func() {
+		time.Sleep(50 * time.Millisecond) // let EachEvent goroutine flush queued events
+		if logF != nil {
+			logF.Close()
+		}
+	}
+}
+
+// startBrowserLogger spawns a single `rodney _logger` subprocess that stays connected
+// to CDP and writes Runtime.consoleAPICalled events for all pages to NDJSON files.
+// No-op if s.Logs is false or if the logger is already alive.
+func startBrowserLogger(s *State) {
+	if !s.Logs {
+		return
+	}
+	// Idempotency: skip if a logger with the stored PID is still running.
+	if s.LoggerPID > 0 {
+		if proc, err := os.FindProcess(s.LoggerPID); err == nil {
+			if proc.Signal(syscall.Signal(0)) == nil {
+				return // already alive
+			}
+		}
+	}
+	logsDir := filepath.Join(stateDir(), "logs")
+	os.MkdirAll(logsDir, 0755)
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "_logger", s.DebugURL, logsDir)
+	setSysProcAttr(cmd)
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to start logger: %v\n", err)
+		return
+	}
+	s.LoggerPID = cmd.Process.Pid
+	cmd.Process.Release()
+	saveState(s)
+}
+
+// cmdInternalLogger is a hidden subcommand: rodney _logger <debugURL> <logsDir>
+// It connects to the running Chrome instance and tracks all pages, writing
+// Runtime.consoleAPICalled events to per-page NDJSON files in logsDir.
+func cmdInternalLogger(args []string) {
+	if len(args) < 2 {
+		fatal("usage: rodney _logger <debugURL> <logsDir>")
+	}
+	debugURL := args[0]
+	logsDir := args[1]
+
+	browser := rod.New().ControlURL(debugURL).MustConnect()
+	os.MkdirAll(logsDir, 0755)
+
+	tracking := map[proto.TargetTargetID]bool{}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-sigCh:
+			return
+		case <-ticker.C:
+			pages, _ := browser.Pages()
+			for _, page := range pages {
+				if !tracking[page.TargetID] {
+					tracking[page.TargetID] = true
+					go trackPage(page, logsDir)
+				}
+			}
+		}
+	}
+}
+
+// trackPage subscribes to console events for a single page and writes them to
+// a per-page NDJSON file. Blocks until the page is closed or context cancelled.
+func trackPage(page *rod.Page, logsDir string) {
+	logFile := filepath.Join(logsDir, string(page.TargetID)+".ndjson")
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	wait := page.EachEvent(func(e *proto.RuntimeConsoleAPICalled) bool {
+		fmt.Fprintln(f, marshalConsoleEntry(makeConsoleEntry(e)))
+		f.Sync()
+		return false
+	})
+	(proto.RuntimeEnable{}).Call(page)
+	wait() // blocks until page closed or context cancelled
 }
 
 // --- Auth proxy for environments with authenticated HTTP proxies ---
