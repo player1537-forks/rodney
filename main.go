@@ -269,6 +269,8 @@ func main() {
 		cmdVisible(args)
 	case "assert":
 		cmdAssert(args)
+	case "ua":
+		cmdUA(args)
 	case "ax-tree":
 		cmdAXTree(args)
 	case "ax-find":
@@ -1491,6 +1493,25 @@ func cmdAssert(args []string) {
 // Ignore SIGPIPE for piped output
 func init() {
 	signal.Ignore(syscall.SIGPIPE)
+}
+
+// --- User agent override ---
+
+// setUserAgent sets or clears the user agent override on a page.
+func setUserAgent(page *rod.Page, ua string) error {
+	return proto.EmulationSetUserAgentOverride{UserAgent: ua}.Call(page)
+}
+
+func cmdUA(args []string) {
+	if len(args) < 1 {
+		fatal("usage: rodney ua <user-agent-string>")
+	}
+	ua := strings.Join(args, " ")
+	_, _, page := withPage()
+	if err := setUserAgent(page, ua); err != nil {
+		fatal("failed to set user agent: %v", err)
+	}
+	fmt.Printf("User-Agent: %s\n", ua)
 }
 
 // --- Accessibility commands ---

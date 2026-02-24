@@ -13,6 +13,9 @@ Navigation:
   rodney reload [--hard]          Reload page (--hard bypasses cache)
   rodney clear-cache              Clear the browser cache
 
+Page settings:
+  rodney ua <user-agent-string>   Override the browser user agent
+
 Page info:
   rodney url                      Print current URL
   rodney title                    Print page title

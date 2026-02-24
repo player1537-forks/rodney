@@ -1148,3 +1148,95 @@ func TestInsecureFlag_WithSelfSignedCert(t *testing.T) {
 		}
 	})
 }
+
+// =====================
+// ua command tests (RED)
+// =====================
+
+func TestUA_SetsUserAgent(t *testing.T) {
+	page := navigateTo(t, "/")
+
+	// Before override, navigator.userAgent should contain "Chrome"
+	before, err := page.Eval(`() => navigator.userAgent`)
+	if err != nil {
+		t.Fatalf("eval failed: %v", err)
+	}
+	if !strings.Contains(before.Value.Str(), "Chrome") {
+		t.Fatalf("expected default UA to contain 'Chrome', got %q", before.Value.Str())
+	}
+
+	// Call the setUserAgent function (same CDP call the ua command will use)
+	err = setUserAgent(page, "Googlebot/2.1")
+	if err != nil {
+		t.Fatalf("setUserAgent failed: %v", err)
+	}
+
+	// After override, navigator.userAgent should return the custom string
+	after, err := page.Eval(`() => navigator.userAgent`)
+	if err != nil {
+		t.Fatalf("eval failed: %v", err)
+	}
+	if after.Value.Str() != "Googlebot/2.1" {
+		t.Errorf("expected UA 'Googlebot/2.1', got %q", after.Value.Str())
+	}
+}
+
+func TestUA_EmptyStringResetsToDefault(t *testing.T) {
+	page := navigateTo(t, "/")
+
+	// Set a custom UA
+	err := setUserAgent(page, "CustomBot/1.0")
+	if err != nil {
+		t.Fatalf("setUserAgent failed: %v", err)
+	}
+
+	// Verify it changed
+	custom, err := page.Eval(`() => navigator.userAgent`)
+	if err != nil {
+		t.Fatalf("eval failed: %v", err)
+	}
+	if custom.Value.Str() != "CustomBot/1.0" {
+		t.Errorf("expected 'CustomBot/1.0', got %q", custom.Value.Str())
+	}
+
+	// Reset with empty string
+	err = setUserAgent(page, "")
+	if err != nil {
+		t.Fatalf("setUserAgent with empty string failed: %v", err)
+	}
+
+	// After reset, UA should no longer be our custom string
+	reset, err := page.Eval(`() => navigator.userAgent`)
+	if err != nil {
+		t.Fatalf("eval failed: %v", err)
+	}
+	if reset.Value.Str() == "CustomBot/1.0" {
+		t.Error("expected UA to be reset from 'CustomBot/1.0', but it was not cleared")
+	}
+	// Should contain something Chrome-like (the browser's real UA)
+	if !strings.Contains(reset.Value.Str(), "Chrome") {
+		t.Errorf("expected reset UA to contain 'Chrome', got %q", reset.Value.Str())
+	}
+}
+
+func TestUA_PersistsAcrossNavigation(t *testing.T) {
+	page := navigateTo(t, "/")
+
+	err := setUserAgent(page, "TestBot/3.0")
+	if err != nil {
+		t.Fatalf("setUserAgent failed: %v", err)
+	}
+
+	// Navigate to a different page
+	page.MustNavigate(env.server.URL + "/form")
+	page.MustWaitLoad()
+
+	// UA should persist
+	result, err := page.Eval(`() => navigator.userAgent`)
+	if err != nil {
+		t.Fatalf("eval failed: %v", err)
+	}
+	if result.Value.Str() != "TestBot/3.0" {
+		t.Errorf("expected UA to persist as 'TestBot/3.0' after navigation, got %q", result.Value.Str())
+	}
+}
