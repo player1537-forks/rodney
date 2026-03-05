@@ -9,12 +9,11 @@ Add commands for setting, reading, and deleting browser cookies. This uses Chrom
 ### `rodney cookie-set` — Set a cookie
 
 ```
-rodney cookie-set <name> <value> [options]
+rodney cookie-set <name> <value> --domain <domain> [options]
 ```
 
 **Options:**
-- `--domain <domain>` — Cookie domain (e.g. `.example.com`). Required unless `--url` is provided.
-- `--url <url>` — Associate cookie with this URL (sets default domain/path/scheme). Mutually exclusive with `--domain`.
+- `--domain <domain>` — Cookie domain (e.g. `.example.com`). **Required.**
 - `--path <path>` — Cookie path (default: `/`)
 - `--secure` — Mark as secure (HTTPS only)
 - `--httponly` — Mark as HTTP-only (not accessible to JavaScript)
@@ -26,9 +25,6 @@ rodney cookie-set <name> <value> [options]
 # Set a cookie on a specific domain
 rodney cookie-set session_id abc123 --domain .example.com
 
-# Set a cookie using current page URL for defaults
-rodney cookie-set theme dark --url https://example.com
-
 # Secure cookie with expiry
 rodney cookie-set token xyz --domain .example.com --secure --httponly --expires 1735689600
 
@@ -36,7 +32,7 @@ rodney cookie-set token xyz --domain .example.com --secure --httponly --expires 
 rodney cookie-set prefs val --domain .example.com --samesite Strict
 ```
 
-**Implementation:** Calls `proto.NetworkSetCookies` with a single `NetworkCookieParam`. Either `--domain` or `--url` must be provided — the command fails with exit code 2 otherwise.
+**Implementation:** Calls `proto.NetworkSetCookies` with a single `NetworkCookieParam`. `--domain` is required — the command fails with exit code 2 if omitted.
 
 ### `rodney cookie-get` — Read cookies
 
@@ -45,7 +41,7 @@ rodney cookie-get [name] [options]
 ```
 
 **Options:**
-- `--url <url>` — Get cookies for a specific URL (can be repeated). If omitted, returns cookies for the current page and its subframes.
+- `--domain <domain>` — Get cookies for a specific domain. Constructs an `https://<domain>/` URL for the CDP call. Can be repeated.
 - `--json` — Output as JSON array (default is a human-readable table)
 
 **Behavior:**
@@ -73,8 +69,8 @@ TOKEN=$(rodney cookie-get session_id)
 # List all cookies for the current page
 rodney cookie-get
 
-# Get cookies for a specific URL
-rodney cookie-get --url https://api.example.com
+# Get cookies for a specific domain
+rodney cookie-get --domain api.example.com
 
 # Full JSON output for scripting
 rodney cookie-get --json
@@ -84,7 +80,7 @@ rodney cookie-get --json session_id
 rodney cookie-get --json | jq '.[] | select(.domain == ".example.com")'
 ```
 
-**Implementation:** Calls `proto.NetworkGetCookies`. When `--url` is provided, passes URLs; otherwise uses the CDP default (current page URLs). When a `name` argument is given without `--json`, prints only the value (no newline-free, like `rodney url` or `rodney title`). With `--json`, filters to matching cookies but outputs full JSON objects.
+**Implementation:** Calls `proto.NetworkGetCookies`. When `--domain` is provided, constructs `https://<domain>/` URLs to pass to CDP; otherwise uses the CDP default (current page URLs). When a `name` argument is given without `--json`, prints only the value (like `rodney url` or `rodney title`). With `--json`, filters to matching cookies but outputs full JSON objects.
 
 **Exit codes:**
 - `0` — Success (cookies found, or listing returned empty list)
@@ -98,7 +94,6 @@ rodney cookie-delete <name> [options]
 
 **Options:**
 - `--domain <domain>` — Only delete cookies with this exact domain
-- `--url <url>` — Only delete cookies matching this URL
 - `--path <path>` — Only delete cookies with this exact path
 
 **Examples:**
@@ -108,12 +103,9 @@ rodney cookie-delete session_id
 
 # Delete a cookie for a specific domain
 rodney cookie-delete session_id --domain .example.com
-
-# Delete by URL
-rodney cookie-delete session_id --url https://example.com/app
 ```
 
-**Implementation:** Calls `proto.NetworkDeleteCookies`. If only `name` is provided (no `--domain`, `--url`, or `--path`), the command first calls `NetworkGetCookies` to find all cookies with that name, then deletes each one (since CDP requires at least name + one of url/domain/path). This "delete by name everywhere" convenience avoids forcing users to know the exact domain.
+**Implementation:** Calls `proto.NetworkDeleteCookies`. If only `name` is provided (no `--domain` or `--path`), the command first calls `NetworkGetCookies` to find all cookies with that name, then deletes each one (since CDP requires at least name + one of domain/path). This "delete by name everywhere" convenience avoids forcing users to know the exact domain.
 
 ### `rodney cookie-clear` — Delete all cookies
 
@@ -131,9 +123,13 @@ No arguments. Clears all browser cookies across all domains.
 
 Rodney uses flat command names (`clear-cache`, `screenshot-el`, `ax-tree`). Following that convention, these are `cookie-set`, `cookie-get`, `cookie-delete`, `cookie-clear` rather than `cookie set`, `cookie get`, etc.
 
-### Why `--domain` is required for set (unless `--url` is used)?
+### Why `--domain` only, no `--url`?
 
-CDP's `Network.setCookies` will silently succeed but create a useless cookie if no domain or URL is provided. Making one of these required prevents confusion.
+CDP accepts either a `url` or a `domain` parameter for cookie operations. A URL infers domain, path, and scheme — but that implicit behavior is confusing. `--domain` + `--path` + `--secure` makes each attribute explicit and independently controllable. There's no ambiguity about what gets set.
+
+### Why `--domain` is required for cookie-set?
+
+CDP's `Network.setCookies` will silently succeed but create a useless cookie if no domain is provided. Making it required prevents confusion.
 
 ### Why tab-separated default output?
 
@@ -141,13 +137,13 @@ The default output mirrors the style of `rodney pages` (human-readable, one item
 
 ### Why no `--all` flag on cookie-get?
 
-`NetworkGetCookies` without URLs returns cookies for the current page. `NetworkGetAllCookies` exists in CDP but is deprecated. Instead, users can pass `--url` for specific domains they care about, which is more intentional. If we find users need "every cookie across all domains" we can add `--all` later.
+`NetworkGetCookies` without URLs returns cookies for the current page. `NetworkGetAllCookies` exists in CDP but is deprecated. Instead, users can pass `--domain` for specific domains they care about, which is more intentional. If we find users need "every cookie across all domains" we can add `--all` later.
 
 ## Help Text Addition
 
 ```
 Cookies:
-  rodney cookie-set <name> <val> [opts]  Set a cookie (--domain or --url required)
+  rodney cookie-set <name> <val> [opts]  Set a cookie (--domain required)
   rodney cookie-get [name] [--json]      Get cookies (name for value, omit for all)
   rodney cookie-delete <name> [opts]     Delete cookies by name
   rodney cookie-clear                    Clear all browser cookies
@@ -165,11 +161,11 @@ Cookies:
 - `cookie-set` + `cookie-get` round-trip: set a cookie, read it back by name, verify value
 - `cookie-get` with `--json`: verify JSON output parses and contains expected fields
 - `cookie-get` all: set multiple cookies, list them, verify all appear
-- `cookie-get` with `--url`: set cookies on different domains, verify filtering works
+- `cookie-get` with `--domain`: set cookies on different domains, verify filtering works
 - `cookie-delete` by name: set cookie, delete it, verify `cookie-get` no longer returns it
 - `cookie-delete` with `--domain`: set same-name cookies on different domains, delete one, verify the other remains
 - `cookie-clear`: set multiple cookies, clear all, verify none remain
-- Error cases: `cookie-set` without `--domain`/`--url`, `cookie-delete` without name
+- Error cases: `cookie-set` without `--domain`, `cookie-delete` without name
 
 ### Estimated size
 
