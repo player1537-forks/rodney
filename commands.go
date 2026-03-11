@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -14,32 +15,864 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 )
 
+// --- Inner functions (shared by CLI and serve mode) ---
+// These take a browser/page/state and return (output, error).
+// They never call fatal(), os.Exit(), or print to stdout/stderr.
+
+// runOpen navigates the active page to a URL. Mutates state.ActivePage if needed.
+func runOpen(browser *rod.Browser, state *State, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney open <url>")
+	}
+	url := args[0]
+	if !strings.Contains(url, "://") {
+		url = "http://" + url
+	}
+
+	pages, _ := browser.Pages()
+	var page *rod.Page
+	if len(pages) == 0 {
+		page = browser.MustPage(url)
+		state.ActivePage = 0
+	} else {
+		var err error
+		page, err = getActivePage(browser, state)
+		if err != nil {
+			return "", err
+		}
+		if err := page.Navigate(url); err != nil {
+			return "", fmt.Errorf("navigation failed: %w", err)
+		}
+	}
+	page.MustWaitLoad()
+	info, _ := page.Info()
+	if info != nil {
+		return info.Title, nil
+	}
+	return "", nil
+}
+
+func runBack(page *rod.Page) (string, error) {
+	page.MustNavigateBack()
+	page.MustWaitLoad()
+	info, _ := page.Info()
+	if info != nil {
+		return info.URL, nil
+	}
+	return "", nil
+}
+
+func runForward(page *rod.Page) (string, error) {
+	page.MustNavigateForward()
+	page.MustWaitLoad()
+	info, _ := page.Info()
+	if info != nil {
+		return info.URL, nil
+	}
+	return "", nil
+}
+
+func runReload(page *rod.Page, args []string) (string, error) {
+	hard := false
+	for _, a := range args {
+		if a == "--hard" {
+			hard = true
+		}
+	}
+	if hard {
+		err := (proto.PageReload{IgnoreCache: true}).Call(page)
+		if err != nil {
+			return "", fmt.Errorf("reload failed: %w", err)
+		}
+	} else {
+		page.MustReload()
+	}
+	page.MustWaitLoad()
+	return "Reloaded", nil
+}
+
+func runClearCache(page *rod.Page) (string, error) {
+	err := (proto.NetworkClearBrowserCache{}).Call(page)
+	if err != nil {
+		return "", fmt.Errorf("clear cache failed: %w", err)
+	}
+	return "Browser cache cleared", nil
+}
+
+func runURL(page *rod.Page) (string, error) {
+	info, err := page.Info()
+	if err != nil {
+		return "", fmt.Errorf("failed to get page info: %w", err)
+	}
+	return info.URL, nil
+}
+
+func runTitle(page *rod.Page) (string, error) {
+	info, err := page.Info()
+	if err != nil {
+		return "", fmt.Errorf("failed to get page info: %w", err)
+	}
+	return info.Title, nil
+}
+
+func runHTML(page *rod.Page, args []string) (string, error) {
+	if len(args) > 0 {
+		el, err := page.Element(args[0])
+		if err != nil {
+			return "", fmt.Errorf("element not found: %w", err)
+		}
+		html, err := el.HTML()
+		if err != nil {
+			return "", fmt.Errorf("failed to get HTML: %w", err)
+		}
+		return html, nil
+	}
+	html := page.MustEval(`() => document.documentElement.outerHTML`).Str()
+	return html, nil
+}
+
+func runText(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney text <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	text, err := el.Text()
+	if err != nil {
+		return "", fmt.Errorf("failed to get text: %w", err)
+	}
+	return text, nil
+}
+
+func runAttr(page *rod.Page, args []string) (string, error) {
+	if len(args) < 2 {
+		return "", fmt.Errorf("usage: rodney attr <selector> <attribute>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	val := el.MustAttribute(args[1])
+	if val == nil {
+		return "", fmt.Errorf("attribute %q not found", args[1])
+	}
+	return *val, nil
+}
+
+func runPDF(page *rod.Page, args []string) (string, error) {
+	file := "page.pdf"
+	if len(args) > 0 {
+		file = args[0]
+	}
+	req := proto.PagePrintToPDF{}
+	r, err := page.PDF(&req)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate PDF: %w", err)
+	}
+	buf := make([]byte, 0)
+	tmp := make([]byte, 32*1024)
+	for {
+		n, err := r.Read(tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+	if err := os.WriteFile(file, buf, 0644); err != nil {
+		return "", fmt.Errorf("failed to write PDF: %w", err)
+	}
+	return fmt.Sprintf("Saved %s (%d bytes)", file, len(buf)), nil
+}
+
+// formatJSResult formats a rod eval result for output.
+func formatJSResult(result *proto.RuntimeRemoteObject) string {
+	v := result.Value
+	raw := v.JSON("", "")
+	switch {
+	case raw == "null" || raw == "undefined":
+		return raw
+	case raw == "true" || raw == "false":
+		return raw
+	case len(raw) > 0 && raw[0] == '"':
+		return v.Str()
+	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
+		return v.JSON("", "  ")
+	default:
+		return raw
+	}
+}
+
+func runJS(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney js <expression>")
+	}
+	expr := strings.Join(args, " ")
+	js := fmt.Sprintf(`() => { return (%s); }`, expr)
+	result, err := page.Eval(js)
+	if err != nil {
+		return "", fmt.Errorf("JS error: %w", err)
+	}
+	return formatJSResult(result), nil
+}
+
+func runClick(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney click <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
+		return "", fmt.Errorf("click failed: %w", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	return "Clicked", nil
+}
+
+func runInput(page *rod.Page, args []string) (string, error) {
+	if len(args) < 2 {
+		return "", fmt.Errorf("usage: rodney input <selector> <text>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	text := strings.Join(args[1:], " ")
+	el.MustSelectAllText().MustInput(text)
+	return fmt.Sprintf("Typed: %s", text), nil
+}
+
+func runClear(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney clear <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	el.MustSelectAllText().MustInput("")
+	return "Cleared", nil
+}
+
+func runFile(page *rod.Page, args []string) (string, error) {
+	if len(args) < 2 {
+		return "", fmt.Errorf("usage: rodney file <selector> <path|->")
+	}
+	selector := args[0]
+	filePath := args[1]
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+
+	if filePath == "-" {
+		data, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return "", fmt.Errorf("failed to read stdin: %w", err)
+		}
+		tmp, err := os.CreateTemp("", "rodney-upload-*")
+		if err != nil {
+			return "", fmt.Errorf("failed to create temp file: %w", err)
+		}
+		if _, err := tmp.Write(data); err != nil {
+			tmp.Close()
+			return "", fmt.Errorf("failed to write temp file: %w", err)
+		}
+		tmp.Close()
+		filePath = tmp.Name()
+	} else {
+		if _, err := os.Stat(filePath); err != nil {
+			return "", fmt.Errorf("file not found: %w", err)
+		}
+	}
+
+	if err := el.SetFiles([]string{filePath}); err != nil {
+		return "", fmt.Errorf("failed to set file: %w", err)
+	}
+	return fmt.Sprintf("Set file: %s", args[1]), nil
+}
+
+func runDownload(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney download <selector> [file|-]")
+	}
+	selector := args[0]
+	outFile := ""
+	if len(args) > 1 {
+		outFile = args[1]
+	}
+
+	el, err := page.Element(selector)
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+
+	urlStr := ""
+	if v := el.MustAttribute("href"); v != nil {
+		urlStr = *v
+	} else if v := el.MustAttribute("src"); v != nil {
+		urlStr = *v
+	} else {
+		return "", fmt.Errorf("element has no href or src attribute")
+	}
+
+	var data []byte
+
+	if strings.HasPrefix(urlStr, "data:") {
+		data, err = decodeDataURL(urlStr)
+		if err != nil {
+			return "", fmt.Errorf("failed to decode data URL: %w", err)
+		}
+	} else {
+		js := fmt.Sprintf(`async () => {
+			const resp = await fetch(%q);
+			if (!resp.ok) throw new Error('HTTP ' + resp.status);
+			const buf = await resp.arrayBuffer();
+			const bytes = new Uint8Array(buf);
+			let binary = '';
+			for (let i = 0; i < bytes.length; i++) {
+				binary += String.fromCharCode(bytes[i]);
+			}
+			return btoa(binary);
+		}`, urlStr)
+		result, err := page.Eval(js)
+		if err != nil {
+			return "", fmt.Errorf("download failed: %w", err)
+		}
+		data, err = base64.StdEncoding.DecodeString(result.Value.Str())
+		if err != nil {
+			return "", fmt.Errorf("failed to decode response: %w", err)
+		}
+	}
+
+	if outFile == "-" {
+		os.Stdout.Write(data)
+		return "", nil
+	}
+
+	if outFile == "" {
+		outFile = inferDownloadFilename(urlStr)
+	}
+
+	if err := os.WriteFile(outFile, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to write file: %w", err)
+	}
+	return fmt.Sprintf("Saved %s (%d bytes)", outFile, len(data)), nil
+}
+
+func runSelect(page *rod.Page, args []string) (string, error) {
+	if len(args) < 2 {
+		return "", fmt.Errorf("usage: rodney select <selector> <value>")
+	}
+	js := fmt.Sprintf(`() => {
+		const el = document.querySelector(%q);
+		if (!el) throw new Error('element not found');
+		el.value = %q;
+		el.dispatchEvent(new Event('change', {bubbles: true}));
+		return el.value;
+	}`, args[0], args[1])
+	result, err := page.Eval(js)
+	if err != nil {
+		return "", fmt.Errorf("select failed: %w", err)
+	}
+	return fmt.Sprintf("Selected: %s", result.Value.Str()), nil
+}
+
+func runSubmit(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney submit <selector>")
+	}
+	_, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("form not found: %w", err)
+	}
+	page.MustEval(fmt.Sprintf(`() => document.querySelector(%q).submit()`, args[0]))
+	return "Submitted", nil
+}
+
+func runHover(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney hover <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	el.MustHover()
+	return "Hovered", nil
+}
+
+func runFocus(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney focus <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	el.MustFocus()
+	return "Focused", nil
+}
+
+func runWait(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney wait <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	el.MustWaitVisible()
+	return "Element visible", nil
+}
+
+func runWaitLoad(page *rod.Page) (string, error) {
+	page.MustWaitLoad()
+	return "Page loaded", nil
+}
+
+func runWaitStable(page *rod.Page) (string, error) {
+	page.MustWaitStable()
+	return "DOM stable", nil
+}
+
+func runWaitIdle(page *rod.Page) (string, error) {
+	page.MustWaitIdle()
+	return "Network idle", nil
+}
+
+func runSleep(args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney sleep <seconds>")
+	}
+	secs, err := strconv.ParseFloat(args[0], 64)
+	if err != nil {
+		return "", fmt.Errorf("invalid seconds: %w", err)
+	}
+	time.Sleep(time.Duration(secs * float64(time.Second)))
+	return "", nil
+}
+
+func runScreenshot(page *rod.Page, args []string) (string, error) {
+	var file string
+	width := 1280
+	height := 0
+	fullPage := true
+
+	var positional []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-w", "--width":
+			i++
+			if i >= len(args) {
+				return "", fmt.Errorf("missing value for %s", args[i-1])
+			}
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return "", fmt.Errorf("invalid width: %w", err)
+			}
+			width = v
+		case "-h", "--height":
+			i++
+			if i >= len(args) {
+				return "", fmt.Errorf("missing value for %s", args[i-1])
+			}
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return "", fmt.Errorf("invalid height: %w", err)
+			}
+			height = v
+			fullPage = false
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+
+	if len(positional) > 0 {
+		file = positional[0]
+	} else {
+		file = nextAvailableFile("screenshot", ".png")
+	}
+
+	viewportHeight := height
+	if viewportHeight == 0 {
+		viewportHeight = 720
+	}
+	err := proto.EmulationSetDeviceMetricsOverride{
+		Width:             width,
+		Height:            viewportHeight,
+		DeviceScaleFactor: 1,
+	}.Call(page)
+	if err != nil {
+		return "", fmt.Errorf("failed to set viewport: %w", err)
+	}
+
+	data, err := page.Screenshot(fullPage, nil)
+	if err != nil {
+		return "", fmt.Errorf("screenshot failed: %w", err)
+	}
+	if err := os.WriteFile(file, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to write screenshot: %w", err)
+	}
+	return file, nil
+}
+
+func runScreenshotEl(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney screenshot-el <selector> [file]")
+	}
+	file := "element.png"
+	if len(args) > 1 {
+		file = args[1]
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "", fmt.Errorf("element not found: %w", err)
+	}
+	data, err := el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
+	if err != nil {
+		return "", fmt.Errorf("screenshot failed: %w", err)
+	}
+	if err := os.WriteFile(file, data, 0644); err != nil {
+		return "", fmt.Errorf("failed to write screenshot: %w", err)
+	}
+	return fmt.Sprintf("Saved %s (%d bytes)", file, len(data)), nil
+}
+
+func runPages(browser *rod.Browser, state *State) (string, error) {
+	pages, err := browser.Pages()
+	if err != nil {
+		return "", fmt.Errorf("failed to list pages: %w", err)
+	}
+	var sb strings.Builder
+	for i, p := range pages {
+		marker := " "
+		if i == state.ActivePage {
+			marker = "*"
+		}
+		info, _ := p.Info()
+		if info != nil {
+			sb.WriteString(fmt.Sprintf("%s [%d] %s - %s\n", marker, i, info.Title, info.URL))
+		} else {
+			sb.WriteString(fmt.Sprintf("%s [%d] (unknown)\n", marker, i))
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n"), nil
+}
+
+func runPage(browser *rod.Browser, state *State, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney page <index>")
+	}
+	idx, err := strconv.Atoi(args[0])
+	if err != nil {
+		return "", fmt.Errorf("invalid index: %w", err)
+	}
+	pages, err := browser.Pages()
+	if err != nil {
+		return "", fmt.Errorf("failed to list pages: %w", err)
+	}
+	if idx < 0 || idx >= len(pages) {
+		return "", fmt.Errorf("page index %d out of range (0-%d)", idx, len(pages)-1)
+	}
+	state.ActivePage = idx
+	info, _ := pages[idx].Info()
+	if info != nil {
+		return fmt.Sprintf("Switched to [%d] %s - %s", idx, info.Title, info.URL), nil
+	}
+	return "", nil
+}
+
+func runNewPage(browser *rod.Browser, state *State, args []string) (string, error) {
+	url := ""
+	if len(args) > 0 {
+		url = args[0]
+		if !strings.Contains(url, "://") {
+			url = "http://" + url
+		}
+	}
+
+	var page *rod.Page
+	if url != "" {
+		page = browser.MustPage(url)
+		page.MustWaitLoad()
+	} else {
+		page = browser.MustPage("")
+	}
+
+	pages, _ := browser.Pages()
+	for i, p := range pages {
+		if p.TargetID == page.TargetID {
+			state.ActivePage = i
+			break
+		}
+	}
+
+	info, _ := page.Info()
+	if info != nil {
+		return fmt.Sprintf("Opened [%d] %s", state.ActivePage, info.URL), nil
+	}
+	return "", nil
+}
+
+func runClosePage(browser *rod.Browser, state *State, args []string) (string, error) {
+	pages, err := browser.Pages()
+	if err != nil {
+		return "", fmt.Errorf("failed to list pages: %w", err)
+	}
+	if len(pages) <= 1 {
+		return "", fmt.Errorf("cannot close the last page")
+	}
+
+	idx := state.ActivePage
+	if len(args) > 0 {
+		idx, err = strconv.Atoi(args[0])
+		if err != nil {
+			return "", fmt.Errorf("invalid index: %w", err)
+		}
+	}
+	if idx < 0 || idx >= len(pages) {
+		return "", fmt.Errorf("page index %d out of range", idx)
+	}
+
+	pages[idx].MustClose()
+
+	if state.ActivePage >= len(pages)-1 {
+		state.ActivePage = len(pages) - 2
+	}
+	if state.ActivePage < 0 {
+		state.ActivePage = 0
+	}
+	return fmt.Sprintf("Closed page %d", idx), nil
+}
+
+// runExists returns (output, exitCode, error). exitCode 0=true, 1=false.
+func runExists(page *rod.Page, args []string) (string, int, error) {
+	if len(args) < 1 {
+		return "", 2, fmt.Errorf("usage: rodney exists <selector>")
+	}
+	has, _, err := page.Has(args[0])
+	if err != nil {
+		return "", 2, fmt.Errorf("query failed: %w", err)
+	}
+	if has {
+		return "true", 0, nil
+	}
+	return "false", 1, nil
+}
+
+func runCount(page *rod.Page, args []string) (string, error) {
+	if len(args) < 1 {
+		return "", fmt.Errorf("usage: rodney count <selector>")
+	}
+	els, err := page.Elements(args[0])
+	if err != nil {
+		return "", fmt.Errorf("query failed: %w", err)
+	}
+	return fmt.Sprintf("%d", len(els)), nil
+}
+
+// runVisible returns (output, exitCode, error). exitCode 0=visible, 1=not visible.
+func runVisible(page *rod.Page, args []string) (string, int, error) {
+	if len(args) < 1 {
+		return "", 2, fmt.Errorf("usage: rodney visible <selector>")
+	}
+	el, err := page.Element(args[0])
+	if err != nil {
+		return "false", 1, nil
+	}
+	visible, err := el.Visible()
+	if err != nil {
+		return "false", 1, nil
+	}
+	if visible {
+		return "true", 0, nil
+	}
+	return "false", 1, nil
+}
+
+// runAssert returns (output, exitCode, error). exitCode 0=pass, 1=fail.
+func runAssert(page *rod.Page, args []string) (string, int, error) {
+	if len(args) < 1 {
+		return "", 2, fmt.Errorf("usage: rodney assert <js-expression> [expected] [--message msg]")
+	}
+
+	expr, expected, message := parseAssertArgs(args)
+	if expr == "" {
+		return "", 2, fmt.Errorf("usage: rodney assert <js-expression> [expected] [--message msg]")
+	}
+
+	js := fmt.Sprintf(`() => { return (%s); }`, expr)
+	result, err := page.Eval(js)
+	if err != nil {
+		return "", 2, fmt.Errorf("JS error: %w", err)
+	}
+
+	v := result.Value
+	raw := v.JSON("", "")
+	var actual string
+	switch {
+	case raw == "null" || raw == "undefined":
+		actual = raw
+	case raw == "true" || raw == "false":
+		actual = raw
+	case len(raw) > 0 && raw[0] == '"':
+		actual = v.Str()
+	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
+		actual = v.JSON("", "  ")
+	default:
+		actual = raw
+	}
+
+	if expected != nil {
+		if actual == *expected {
+			return "pass", 0, nil
+		}
+		return formatAssertFail(actual, expected, message), 1, nil
+	}
+
+	switch raw {
+	case "false", "0", "null", "undefined", `""`:
+		return formatAssertFail(actual, nil, message), 1, nil
+	default:
+		return "pass", 0, nil
+	}
+}
+
+// runAXTree runs the ax-tree command.
+func runAXTree(page *rod.Page, args []string) (string, error) {
+	var depth *int
+	jsonOutput := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--depth":
+			i++
+			if i >= len(args) {
+				return "", fmt.Errorf("missing value for --depth")
+			}
+			v, err := strconv.Atoi(args[i])
+			if err != nil {
+				return "", fmt.Errorf("invalid depth: %w", err)
+			}
+			depth = &v
+		case "--json":
+			jsonOutput = true
+		default:
+			return "", fmt.Errorf("unknown flag: %s\nusage: rodney ax-tree [--depth N] [--json]", args[i])
+		}
+	}
+
+	result, err := proto.AccessibilityGetFullAXTree{Depth: depth}.Call(page)
+	if err != nil {
+		return "", fmt.Errorf("failed to get accessibility tree: %w", err)
+	}
+
+	if jsonOutput {
+		return formatAXTreeJSON(result.Nodes), nil
+	}
+	return strings.TrimRight(formatAXTree(result.Nodes), "\n"), nil
+}
+
+// runAXFind runs the ax-find command. Returns (output, exitCode, error).
+func runAXFind(page *rod.Page, args []string) (string, int, error) {
+	var name, role string
+	jsonOutput := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--name":
+			i++
+			if i >= len(args) {
+				return "", 2, fmt.Errorf("missing value for --name")
+			}
+			name = args[i]
+		case "--role":
+			i++
+			if i >= len(args) {
+				return "", 2, fmt.Errorf("missing value for --role")
+			}
+			role = args[i]
+		case "--json":
+			jsonOutput = true
+		default:
+			return "", 2, fmt.Errorf("unknown flag: %s\nusage: rodney ax-find [--name N] [--role R] [--json]", args[i])
+		}
+	}
+
+	nodes, err := queryAXNodes(page, name, role)
+	if err != nil {
+		return "", 2, fmt.Errorf("query failed: %w", err)
+	}
+
+	if len(nodes) == 0 {
+		return "No matching nodes", 1, nil
+	}
+
+	if jsonOutput {
+		data, _ := json.MarshalIndent(nodes, "", "  ")
+		return string(data), 0, nil
+	}
+	return strings.TrimRight(formatAXNodeList(nodes), "\n"), 0, nil
+}
+
+// runAXNode runs the ax-node command.
+func runAXNode(page *rod.Page, args []string) (string, error) {
+	jsonOutput := false
+	var positional []string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			jsonOutput = true
+		default:
+			positional = append(positional, args[i])
+		}
+	}
+
+	if len(positional) < 1 {
+		return "", fmt.Errorf("usage: rodney ax-node <selector> [--json]")
+	}
+	selector := positional[0]
+
+	node, err := getAXNode(page, selector)
+	if err != nil {
+		return "", err
+	}
+
+	if jsonOutput {
+		return formatAXNodeDetailJSON(node), nil
+	}
+	return strings.TrimRight(formatAXNodeDetail(node), "\n"), nil
+}
+
+// --- CLI wrappers (thin: call runXxx, handle fatal/stdout/exit) ---
+
 func cmdStart(args []string) {
 	ignoreCertErrors := false
+	headless := true
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--insecure", "-k":
 			ignoreCertErrors = true
+		case "--show":
+			headless = false
 		default:
-			fatal("unknown flag: %s\nusage: rodney start [--insecure]", args[i])
+			fatal("unknown flag: %s\nusage: rodney start [--show] [--insecure]", args[i])
 		}
 	}
 
 	// Check if already running
 	if s, err := loadState(); err == nil {
-		// Try connecting
 		if b, err := connectBrowser(s); err == nil {
 			b.MustClose()
-			// It was actually running, warn
 			removeState()
-		}
-	}
-
-	// Parse flags
-	headless := true
-	for _, arg := range args {
-		if arg == "--show" {
-			headless = false
 		}
 	}
 
@@ -61,7 +894,7 @@ func cmdConnect(args []string) {
 	pages, _ := browser.Pages()
 	state := &State{
 		DebugURL:   hostport,
-		ChromePID:  0, // external browser
+		ChromePID:  0,
 		ActivePage: 0,
 	}
 	if err := saveState(state); err != nil {
@@ -77,7 +910,6 @@ func cmdStop(args []string) {
 	}
 	browser, err := connectBrowser(s)
 	if err != nil {
-		// Try to kill by PID only if we launched the browser
 		if s.ChromePID > 0 {
 			proc, err := os.FindProcess(s.ChromePID)
 			if err == nil {
@@ -85,11 +917,8 @@ func cmdStop(args []string) {
 			}
 		}
 	} else if s.ChromePID > 0 {
-		// Only close (and kill) the browser if we launched it
 		browser.MustClose()
 	}
-	// If ChromePID==0 we connected to an external browser; just clear state without closing it
-	// Also kill the proxy helper if running
 	if s.ProxyPID > 0 {
 		if proc, err := os.FindProcess(s.ProxyPID); err == nil {
 			proc.Signal(syscall.SIGTERM)
@@ -124,15 +953,6 @@ func cmdStatus(args []string) {
 }
 
 func cmdOpen(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney open <url>")
-	}
-	url := args[0]
-	// Add scheme if missing
-	if !strings.Contains(url, "://") {
-		url = "http://" + url
-	}
-
 	s, err := loadState()
 	if err != nil {
 		fatal("%v", err)
@@ -141,557 +961,259 @@ func cmdOpen(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-
-	// If no pages exist, create one
-	pages, _ := browser.Pages()
-	var page *rod.Page
-	if len(pages) == 0 {
-		page = browser.MustPage(url)
-		s.ActivePage = 0
-		saveState(s)
-	} else {
-		page, err = getActivePage(browser, s)
-		if err != nil {
-			fatal("%v", err)
-		}
-		if err := page.Navigate(url); err != nil {
-			fatal("navigation failed: %v", err)
-		}
+	result, err := runOpen(browser, s, args)
+	if err != nil {
+		fatal("%v", err)
 	}
-	page.MustWaitLoad()
-	info, _ := page.Info()
-	if info != nil {
-		fmt.Println(info.Title)
+	saveState(s)
+	if result != "" {
+		fmt.Println(result)
 	}
 }
 
 func cmdBack(args []string) {
 	_, _, page := withPage()
-	page.MustNavigateBack()
-	page.MustWaitLoad()
-	info, _ := page.Info()
-	if info != nil {
-		fmt.Println(info.URL)
+	result, err := runBack(page)
+	if err != nil {
+		fatal("%v", err)
 	}
+	fmt.Println(result)
 }
 
 func cmdForward(args []string) {
 	_, _, page := withPage()
-	page.MustNavigateForward()
-	page.MustWaitLoad()
-	info, _ := page.Info()
-	if info != nil {
-		fmt.Println(info.URL)
+	result, err := runForward(page)
+	if err != nil {
+		fatal("%v", err)
 	}
+	fmt.Println(result)
 }
 
 func cmdReload(args []string) {
-	hard := false
-	for _, a := range args {
-		if a == "--hard" {
-			hard = true
-		}
-	}
 	_, _, page := withPage()
-	if hard {
-		// CDP Page.reload with ignoreCache (equivalent to Shift+Refresh)
-		err := (proto.PageReload{IgnoreCache: true}).Call(page)
-		if err != nil {
-			fatal("reload failed: %v", err)
-		}
-	} else {
-		page.MustReload()
+	result, err := runReload(page, args)
+	if err != nil {
+		fatal("%v", err)
 	}
-	page.MustWaitLoad()
-	fmt.Println("Reloaded")
+	fmt.Println(result)
 }
 
 func cmdClearCache(args []string) {
 	_, _, page := withPage()
-	err := (proto.NetworkClearBrowserCache{}).Call(page)
+	result, err := runClearCache(page)
 	if err != nil {
-		fatal("clear cache failed: %v", err)
+		fatal("%v", err)
 	}
-	fmt.Println("Browser cache cleared")
+	fmt.Println(result)
 }
 
 func cmdURL(args []string) {
 	_, _, page := withPage()
-	info, err := page.Info()
+	result, err := runURL(page)
 	if err != nil {
-		fatal("failed to get page info: %v", err)
+		fatal("%v", err)
 	}
-	fmt.Println(info.URL)
+	fmt.Println(result)
 }
 
 func cmdTitle(args []string) {
 	_, _, page := withPage()
-	info, err := page.Info()
+	result, err := runTitle(page)
 	if err != nil {
-		fatal("failed to get page info: %v", err)
+		fatal("%v", err)
 	}
-	fmt.Println(info.Title)
+	fmt.Println(result)
 }
 
 func cmdHTML(args []string) {
 	_, _, page := withPage()
-	if len(args) > 0 {
-		el, err := page.Element(args[0])
-		if err != nil {
-			fatal("element not found: %v", err)
-		}
-		html, err := el.HTML()
-		if err != nil {
-			fatal("failed to get HTML: %v", err)
-		}
-		fmt.Println(html)
-	} else {
-		html := page.MustEval(`() => document.documentElement.outerHTML`).Str()
-		fmt.Println(html)
+	result, err := runHTML(page, args)
+	if err != nil {
+		fatal("%v", err)
 	}
+	fmt.Println(result)
 }
 
 func cmdText(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney text <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runText(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	text, err := el.Text()
-	if err != nil {
-		fatal("failed to get text: %v", err)
-	}
-	fmt.Println(text)
+	fmt.Println(result)
 }
 
 func cmdAttr(args []string) {
-	if len(args) < 2 {
-		fatal("usage: rodney attr <selector> <attribute>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runAttr(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	val := el.MustAttribute(args[1])
-	if val == nil {
-		fatal("attribute %q not found", args[1])
-	}
-	fmt.Println(*val)
+	fmt.Println(result)
 }
 
 func cmdPDF(args []string) {
-	file := "page.pdf"
-	if len(args) > 0 {
-		file = args[0]
-	}
 	_, _, page := withPage()
-	req := proto.PagePrintToPDF{}
-	r, err := page.PDF(&req)
+	result, err := runPDF(page, args)
 	if err != nil {
-		fatal("failed to generate PDF: %v", err)
+		fatal("%v", err)
 	}
-	buf := make([]byte, 0)
-	tmp := make([]byte, 32*1024)
-	for {
-		n, err := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-	if err := os.WriteFile(file, buf, 0644); err != nil {
-		fatal("failed to write PDF: %v", err)
-	}
-	fmt.Printf("Saved %s (%d bytes)\n", file, len(buf))
+	fmt.Println(result)
 }
 
 func cmdJS(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney js <expression>")
-	}
-	expr := strings.Join(args, " ")
 	_, _, page := withPage()
-
-	// Wrap bare expressions in a function
-	js := fmt.Sprintf(`() => { return (%s); }`, expr)
-	result, err := page.Eval(js)
+	result, err := runJS(page, args)
 	if err != nil {
-		fatal("JS error: %v", err)
+		fatal("%v", err)
 	}
-	// Print the value based on its JSON type
-	v := result.Value
-	raw := v.JSON("", "")
-	// For simple types, print cleanly; for objects/arrays, pretty-print
-	switch {
-	case raw == "null" || raw == "undefined":
-		fmt.Println(raw)
-	case raw == "true" || raw == "false":
-		fmt.Println(raw)
-	case len(raw) > 0 && raw[0] == '"':
-		// String value - print unquoted
-		fmt.Println(v.Str())
-	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
-		// Object or array - pretty print
-		fmt.Println(v.JSON("", "  "))
-	default:
-		// Numbers and other primitives
-		fmt.Println(raw)
-	}
+	fmt.Println(result)
 }
 
 func cmdClick(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney click <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runClick(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	if err := el.Click(proto.InputMouseButtonLeft, 1); err != nil {
-		fatal("click failed: %v", err)
-	}
-	// Brief pause for click handlers to execute
-	time.Sleep(100 * time.Millisecond)
-	fmt.Println("Clicked")
+	fmt.Println(result)
 }
 
 func cmdInput(args []string) {
-	if len(args) < 2 {
-		fatal("usage: rodney input <selector> <text>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runInput(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	text := strings.Join(args[1:], " ")
-	el.MustSelectAllText().MustInput(text)
-	fmt.Printf("Typed: %s\n", text)
+	fmt.Println(result)
 }
 
 func cmdClear(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney clear <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runClear(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	el.MustSelectAllText().MustInput("")
-	fmt.Println("Cleared")
+	fmt.Println(result)
 }
 
 func cmdFile(args []string) {
-	if len(args) < 2 {
-		fatal("usage: rodney file <selector> <path|->")
-	}
-	selector := args[0]
-	filePath := args[1]
-
 	_, _, page := withPage()
-	el, err := page.Element(selector)
+	result, err := runFile(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-
-	if filePath == "-" {
-		// Read from stdin to a temp file
-		data, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			fatal("failed to read stdin: %v", err)
-		}
-		tmp, err := os.CreateTemp("", "rodney-upload-*")
-		if err != nil {
-			fatal("failed to create temp file: %v", err)
-		}
-		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
-			fatal("failed to write temp file: %v", err)
-		}
-		tmp.Close()
-		filePath = tmp.Name()
-	} else {
-		if _, err := os.Stat(filePath); err != nil {
-			fatal("file not found: %v", err)
-		}
+	if result != "" {
+		fmt.Println(result)
 	}
-
-	if err := el.SetFiles([]string{filePath}); err != nil {
-		fatal("failed to set file: %v", err)
-	}
-	fmt.Printf("Set file: %s\n", args[1])
 }
 
 func cmdDownload(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney download <selector> [file|-]")
-	}
-	selector := args[0]
-	outFile := ""
-	if len(args) > 1 {
-		outFile = args[1]
-	}
-
 	_, _, page := withPage()
-	el, err := page.Element(selector)
+	result, err := runDownload(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-
-	// Get the URL from the element's href or src attribute
-	urlStr := ""
-	if v := el.MustAttribute("href"); v != nil {
-		urlStr = *v
-	} else if v := el.MustAttribute("src"); v != nil {
-		urlStr = *v
-	} else {
-		fatal("element has no href or src attribute")
+	if result != "" {
+		fmt.Println(result)
 	}
-
-	var data []byte
-
-	if strings.HasPrefix(urlStr, "data:") {
-		data, err = decodeDataURL(urlStr)
-		if err != nil {
-			fatal("failed to decode data URL: %v", err)
-		}
-	} else {
-		// Use fetch() in the page context so it has cookies/session
-		// Also resolves relative URLs automatically
-		js := fmt.Sprintf(`async () => {
-			const resp = await fetch(%q);
-			if (!resp.ok) throw new Error('HTTP ' + resp.status);
-			const buf = await resp.arrayBuffer();
-			const bytes = new Uint8Array(buf);
-			let binary = '';
-			for (let i = 0; i < bytes.length; i++) {
-				binary += String.fromCharCode(bytes[i]);
-			}
-			return btoa(binary);
-		}`, urlStr)
-		result, err := page.Eval(js)
-		if err != nil {
-			fatal("download failed: %v", err)
-		}
-		data, err = base64.StdEncoding.DecodeString(result.Value.Str())
-		if err != nil {
-			fatal("failed to decode response: %v", err)
-		}
-	}
-
-	if outFile == "-" {
-		os.Stdout.Write(data)
-		return
-	}
-
-	if outFile == "" {
-		outFile = inferDownloadFilename(urlStr)
-	}
-
-	if err := os.WriteFile(outFile, data, 0644); err != nil {
-		fatal("failed to write file: %v", err)
-	}
-	fmt.Printf("Saved %s (%d bytes)\n", outFile, len(data))
 }
 
 func cmdSelect(args []string) {
-	if len(args) < 2 {
-		fatal("usage: rodney select <selector> <value>")
-	}
 	_, _, page := withPage()
-	// Use JavaScript to set the value, as rod's Select matches by text
-	js := fmt.Sprintf(`() => {
-		const el = document.querySelector(%q);
-		if (!el) throw new Error('element not found');
-		el.value = %q;
-		el.dispatchEvent(new Event('change', {bubbles: true}));
-		return el.value;
-	}`, args[0], args[1])
-	result, err := page.Eval(js)
+	result, err := runSelect(page, args)
 	if err != nil {
-		fatal("select failed: %v", err)
+		fatal("%v", err)
 	}
-	fmt.Printf("Selected: %s\n", result.Value.Str())
+	fmt.Println(result)
 }
 
 func cmdSubmit(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney submit <selector>")
-	}
 	_, _, page := withPage()
-	_, err := page.Element(args[0])
+	result, err := runSubmit(page, args)
 	if err != nil {
-		fatal("form not found: %v", err)
+		fatal("%v", err)
 	}
-	page.MustEval(fmt.Sprintf(`() => document.querySelector(%q).submit()`, args[0]))
-	fmt.Println("Submitted")
+	fmt.Println(result)
 }
 
 func cmdHover(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney hover <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runHover(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	el.MustHover()
-	fmt.Println("Hovered")
+	fmt.Println(result)
 }
 
 func cmdFocus(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney focus <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runFocus(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	el.MustFocus()
-	fmt.Println("Focused")
+	fmt.Println(result)
 }
 
 func cmdWait(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney wait <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runWait(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	el.MustWaitVisible()
-	fmt.Println("Element visible")
+	fmt.Println(result)
 }
 
 func cmdWaitLoad(args []string) {
 	_, _, page := withPage()
-	page.MustWaitLoad()
-	fmt.Println("Page loaded")
+	result, err := runWaitLoad(page)
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println(result)
 }
 
 func cmdWaitStable(args []string) {
 	_, _, page := withPage()
-	page.MustWaitStable()
-	fmt.Println("DOM stable")
+	result, err := runWaitStable(page)
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println(result)
 }
 
 func cmdWaitIdle(args []string) {
 	_, _, page := withPage()
-	page.MustWaitIdle()
-	fmt.Println("Network idle")
+	result, err := runWaitIdle(page)
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println(result)
 }
 
 func cmdSleep(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney sleep <seconds>")
-	}
-	secs, err := strconv.ParseFloat(args[0], 64)
+	_, err := runSleep(args)
 	if err != nil {
-		fatal("invalid seconds: %v", err)
+		fatal("%v", err)
 	}
-	time.Sleep(time.Duration(secs * float64(time.Second)))
 }
 
 func cmdScreenshot(args []string) {
-	var file string
-	width := 1280
-	height := 0
-	fullPage := true
-
-	// Parse flags and positional args
-	var positional []string
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-w", "--width":
-			i++
-			if i >= len(args) {
-				fatal("missing value for %s", args[i-1])
-			}
-			v, err := strconv.Atoi(args[i])
-			if err != nil {
-				fatal("invalid width: %v", err)
-			}
-			width = v
-		case "-h", "--height":
-			i++
-			if i >= len(args) {
-				fatal("missing value for %s", args[i-1])
-			}
-			v, err := strconv.Atoi(args[i])
-			if err != nil {
-				fatal("invalid height: %v", err)
-			}
-			height = v
-			fullPage = false
-		default:
-			positional = append(positional, args[i])
-		}
-	}
-
-	if len(positional) > 0 {
-		file = positional[0]
-	} else {
-		file = nextAvailableFile("screenshot", ".png")
-	}
-
 	_, _, page := withPage()
-
-	// Set viewport size
-	viewportHeight := height
-	if viewportHeight == 0 {
-		viewportHeight = 720
-	}
-	err := proto.EmulationSetDeviceMetricsOverride{
-		Width:             width,
-		Height:            viewportHeight,
-		DeviceScaleFactor: 1,
-	}.Call(page)
+	result, err := runScreenshot(page, args)
 	if err != nil {
-		fatal("failed to set viewport: %v", err)
+		fatal("%v", err)
 	}
-
-	data, err := page.Screenshot(fullPage, nil)
-	if err != nil {
-		fatal("screenshot failed: %v", err)
-	}
-	if err := os.WriteFile(file, data, 0644); err != nil {
-		fatal("failed to write screenshot: %v", err)
-	}
-	fmt.Println(file)
+	fmt.Println(result)
 }
 
 func cmdScreenshotEl(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney screenshot-el <selector> [file]")
-	}
-	file := "element.png"
-	if len(args) > 1 {
-		file = args[1]
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, err := runScreenshotEl(page, args)
 	if err != nil {
-		fatal("element not found: %v", err)
+		fatal("%v", err)
 	}
-	data, err := el.Screenshot(proto.PageCaptureScreenshotFormatPng, 0)
-	if err != nil {
-		fatal("screenshot failed: %v", err)
-	}
-	if err := os.WriteFile(file, data, 0644); err != nil {
-		fatal("failed to write screenshot: %v", err)
-	}
-	fmt.Printf("Saved %s (%d bytes)\n", file, len(data))
+	fmt.Println(result)
 }
 
 func cmdPages(args []string) {
@@ -703,32 +1225,14 @@ func cmdPages(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	result, err := runPages(browser, s)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
 	}
-	for i, p := range pages {
-		marker := " "
-		if i == s.ActivePage {
-			marker = "*"
-		}
-		info, _ := p.Info()
-		if info != nil {
-			fmt.Printf("%s [%d] %s - %s\n", marker, i, info.Title, info.URL)
-		} else {
-			fmt.Printf("%s [%d] (unknown)\n", marker, i)
-		}
-	}
+	fmt.Println(result)
 }
 
 func cmdPage(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney page <index>")
-	}
-	idx, err := strconv.Atoi(args[0])
-	if err != nil {
-		fatal("invalid index: %v", err)
-	}
 	s, err := loadState()
 	if err != nil {
 		fatal("%v", err)
@@ -737,21 +1241,12 @@ func cmdPage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	result, err := runPage(browser, s, args)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
+		fatal("%v", err)
 	}
-	if idx < 0 || idx >= len(pages) {
-		fatal("page index %d out of range (0-%d)", idx, len(pages)-1)
-	}
-	s.ActivePage = idx
-	if err := saveState(s); err != nil {
-		fatal("failed to save state: %v", err)
-	}
-	info, _ := pages[idx].Info()
-	if info != nil {
-		fmt.Printf("Switched to [%d] %s - %s\n", idx, info.Title, info.URL)
-	}
+	saveState(s)
+	fmt.Println(result)
 }
 
 func cmdNewPage(args []string) {
@@ -763,36 +1258,13 @@ func cmdNewPage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-
-	url := ""
-	if len(args) > 0 {
-		url = args[0]
-		if !strings.Contains(url, "://") {
-			url = "http://" + url
-		}
-	}
-
-	var page *rod.Page
-	if url != "" {
-		page = browser.MustPage(url)
-		page.MustWaitLoad()
-	} else {
-		page = browser.MustPage("")
-	}
-
-	// Switch active to the new page
-	pages, _ := browser.Pages()
-	for i, p := range pages {
-		if p.TargetID == page.TargetID {
-			s.ActivePage = i
-			break
-		}
+	result, err := runNewPage(browser, s, args)
+	if err != nil {
+		fatal("%v", err)
 	}
 	saveState(s)
-
-	info, _ := page.Info()
-	if info != nil {
-		fmt.Printf("Opened [%d] %s\n", s.ActivePage, info.URL)
+	if result != "" {
+		fmt.Println(result)
 	}
 }
 
@@ -805,145 +1277,80 @@ func cmdClosePage(args []string) {
 	if err != nil {
 		fatal("%v", err)
 	}
-	pages, err := browser.Pages()
+	result, err := runClosePage(browser, s, args)
 	if err != nil {
-		fatal("failed to list pages: %v", err)
-	}
-	if len(pages) <= 1 {
-		fatal("cannot close the last page")
-	}
-
-	idx := s.ActivePage
-	if len(args) > 0 {
-		idx, err = strconv.Atoi(args[0])
-		if err != nil {
-			fatal("invalid index: %v", err)
-		}
-	}
-	if idx < 0 || idx >= len(pages) {
-		fatal("page index %d out of range", idx)
-	}
-
-	pages[idx].MustClose()
-
-	// Adjust active page
-	if s.ActivePage >= len(pages)-1 {
-		s.ActivePage = len(pages) - 2
-	}
-	if s.ActivePage < 0 {
-		s.ActivePage = 0
+		fatal("%v", err)
 	}
 	saveState(s)
-	fmt.Printf("Closed page %d\n", idx)
+	fmt.Println(result)
 }
 
 func cmdExists(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney exists <selector>")
-	}
 	_, _, page := withPage()
-	has, _, err := page.Has(args[0])
+	result, exitCode, err := runExists(page, args)
 	if err != nil {
-		fatal("query failed: %v", err)
+		fatal("%v", err)
 	}
-	if has {
-		fmt.Println("true")
-		os.Exit(0)
-	} else {
-		fmt.Println("false")
-		os.Exit(1)
-	}
+	fmt.Println(result)
+	os.Exit(exitCode)
 }
 
 func cmdCount(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney count <selector>")
-	}
 	_, _, page := withPage()
-	els, err := page.Elements(args[0])
+	result, err := runCount(page, args)
 	if err != nil {
-		fatal("query failed: %v", err)
+		fatal("%v", err)
 	}
-	fmt.Println(len(els))
+	fmt.Println(result)
 }
 
 func cmdVisible(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney visible <selector>")
-	}
 	_, _, page := withPage()
-	el, err := page.Element(args[0])
+	result, exitCode, err := runVisible(page, args)
 	if err != nil {
-		fmt.Println("false")
-		os.Exit(1)
+		fatal("%v", err)
 	}
-	visible, err := el.Visible()
-	if err != nil {
-		fmt.Println("false")
-		os.Exit(1)
-	}
-	if visible {
-		fmt.Println("true")
-		os.Exit(0)
-	} else {
-		fmt.Println("false")
-		os.Exit(1)
-	}
+	fmt.Println(result)
+	os.Exit(exitCode)
 }
 
 func cmdAssert(args []string) {
-	if len(args) < 1 {
-		fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
-	}
-
-	expr, expected, message := parseAssertArgs(args)
-	if expr == "" {
-		fatal("usage: rodney assert <js-expression> [expected] [--message msg]")
-	}
-
 	_, _, page := withPage()
-
-	js := fmt.Sprintf(`() => { return (%s); }`, expr)
-	result, err := page.Eval(js)
+	result, exitCode, err := runAssert(page, args)
 	if err != nil {
-		fatal("JS error: %v", err)
+		fatal("%v", err)
 	}
+	fmt.Println(result)
+	os.Exit(exitCode)
+}
 
-	// Format the result value as a string, matching the js command's output
-	v := result.Value
-	raw := v.JSON("", "")
-	var actual string
-	switch {
-	case raw == "null" || raw == "undefined":
-		actual = raw
-	case raw == "true" || raw == "false":
-		actual = raw
-	case len(raw) > 0 && raw[0] == '"':
-		actual = v.Str()
-	case len(raw) > 0 && (raw[0] == '{' || raw[0] == '['):
-		actual = v.JSON("", "  ")
-	default:
-		actual = raw
+func cmdAXTree(args []string) {
+	_, _, page := withPage()
+	result, err := runAXTree(page, args)
+	if err != nil {
+		fatal("%v", err)
 	}
+	fmt.Println(result)
+}
 
-	if expected != nil {
-		// Equality mode: compare string representation to expected
-		if actual == *expected {
-			fmt.Println("pass")
-			os.Exit(0)
-		} else {
-			fmt.Println(formatAssertFail(actual, expected, message))
-			os.Exit(1)
-		}
-	} else {
-		// Truthy mode: check if the JS value is truthy
-		switch raw {
-		case "false", "0", "null", "undefined", `""`:
-			fmt.Println(formatAssertFail(actual, nil, message))
-			os.Exit(1)
-		default:
-			fmt.Println("pass")
-			os.Exit(0)
-		}
+func cmdAXFind(args []string) {
+	_, _, page := withPage()
+	result, exitCode, err := runAXFind(page, args)
+	if err != nil {
+		fatal("%v", err)
 	}
+	if exitCode == 1 {
+		fmt.Fprintln(os.Stderr, result)
+		os.Exit(1)
+	}
+	fmt.Println(result)
+}
+
+func cmdAXNode(args []string) {
+	_, _, page := withPage()
+	result, err := runAXNode(page, args)
+	if err != nil {
+		fatal("%v", err)
+	}
+	fmt.Println(result)
 }
