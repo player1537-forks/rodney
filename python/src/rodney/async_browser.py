@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 
 from rodney._types import RodneyError, CheckFailed, RunResult
 from rodney.browser import _parse_js
@@ -30,9 +32,11 @@ class AsyncBrowser:
         self._next_id = 0
         self._proc: asyncio.subprocess.Process | None = None
         self._started = False
+        self._state_dir = tempfile.mkdtemp(prefix="rodney-py-")
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
+        env["RODNEY_HOME"] = self._state_dir
         env["ROD_TIMEOUT"] = str(self._timeout)
         if self._chrome_bin:
             env["ROD_CHROME_BIN"] = self._chrome_bin
@@ -104,6 +108,9 @@ class AsyncBrowser:
                 await asyncio.wait_for(self._proc.wait(), timeout=10)
             except asyncio.TimeoutError:
                 self._proc.kill()
+        if self._state_dir:
+            shutil.rmtree(self._state_dir, ignore_errors=True)
+            self._state_dir = None
 
     async def __aenter__(self):
         await self._start()

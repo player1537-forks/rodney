@@ -43,10 +43,12 @@ class Browser:
         self._next_id = 0
         self._proc: subprocess.Popen | None = None
         self._started = False
+        self._state_dir = tempfile.mkdtemp(prefix="rodney-py-")
         self._start()
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
+        env["RODNEY_HOME"] = self._state_dir
         env["ROD_TIMEOUT"] = str(self._timeout)
         if self._chrome_bin:
             env["ROD_CHROME_BIN"] = self._chrome_bin
@@ -116,6 +118,9 @@ class Browser:
                 self._proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
+        if self._state_dir:
+            shutil.rmtree(self._state_dir, ignore_errors=True)
+            self._state_dir = None
 
     def __enter__(self):
         return self
