@@ -2,5 +2,6 @@
 dist
 .DS_Store
 python/.venv/
+python/uv.lock
 __pycache__/
 *.pyc
