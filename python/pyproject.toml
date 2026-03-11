@@ -1,5 +1,5 @@
 [project]
-name = "rodney-py"
+name = "rodney"
 version = "0.1.0"
 description = "Python client for rodney Chrome automation"
 readme = "README.md"
